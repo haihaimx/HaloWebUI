@@ -1,0 +1,2 @@
+playwright==1.49.1
+firecrawl-py==1.12.0

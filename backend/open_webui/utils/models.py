@@ -1,0 +1,373 @@
+import asyncio
+import copy
+import time
+import logging
+import sys
+from typing import Optional
+
+from fastapi import Request
+
+from open_webui.routers import openai, ollama, gemini, anthropic
+from open_webui.functions import get_function_models
+
+
+from open_webui.models.functions import Functions
+from open_webui.models.models import Models
+
+
+from open_webui.utils.plugin import load_function_module_by_id
+from open_webui.utils.access_control import has_access
+
+
+
+from open_webui.env import SRC_LOG_LEVELS, GLOBAL_LOG_LEVEL
+from open_webui.models.users import UserModel
+
+
+logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
+log = logging.getLogger(__name__)
+log.setLevel(SRC_LOG_LEVELS["MAIN"])
+
+
+# Per-user model cache: {user_id: (timestamp, models)}
+_base_model_cache: dict[str, tuple[float, list]] = {}
+_BASE_MODEL_CACHE_TTL = 10  # seconds
+
+
+async def _fetch_all_base_models(request: Request, user: UserModel = None):
+    # Base models are now user-scoped (per-user connections). Provider routers return [] when
+    # the user has no configured connections for that provider.
+    # Fetch all providers in parallel for better performance.
+    openai_resp, ollama_resp, gemini_resp, anthropic_resp = await asyncio.gather(
+        openai.get_all_models(request, user=user),
+        ollama.get_all_models(request, user=user),
+        gemini.get_all_models(request, user=user),
+        anthropic.get_all_models(request, user=user),
+        return_exceptions=True,
+    )
+
+    # Process openai
+    if isinstance(openai_resp, Exception):
+        log.warning(f"Base models fetch failed: openai: {type(openai_resp).__name__}: {openai_resp}")
+        openai_models = []
+    else:
+        openai_models = openai_resp.get("data", []) if isinstance(openai_resp, dict) else []
+
+    # Process ollama
+    if isinstance(ollama_resp, Exception):
+        log.warning(f"Base models fetch failed: ollama: {type(ollama_resp).__name__}: {ollama_resp}")
+        ollama_models = []
+    elif isinstance(ollama_resp, dict) and "models" in ollama_resp:
+        ollama_models = [
+            {
+                "id": model["model"],
+                "name": model["name"],
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "ollama",
+                "ollama": model,
+                **(
+                    {"connection_name": model.get("connection_name")}
+                    if model.get("connection_name")
+                    else {}
+                ),
+                **(
+                    {"connection_icon": model.get("connection_icon")}
+                    if model.get("connection_icon")
+                    else {}
+                ),
+                "tags": model.get("tags", []),
+            }
+            for model in ollama_resp.get("models", []) or []
+            if isinstance(model, dict) and model.get("model") and model.get("name")
+        ]
+    else:
+        ollama_models = []
+
+    # Process gemini
+    if isinstance(gemini_resp, Exception):
+        log.warning(f"Base models fetch failed: gemini: {type(gemini_resp).__name__}: {gemini_resp}")
+        gemini_models = []
+    else:
+        gemini_models = gemini_resp.get("data", []) if isinstance(gemini_resp, dict) else []
+
+    # Process anthropic
+    if isinstance(anthropic_resp, Exception):
+        log.warning(f"Base models fetch failed: anthropic: {type(anthropic_resp).__name__}: {anthropic_resp}")
+        anthropic_models = []
+    else:
+        anthropic_models = anthropic_resp.get("data", []) if isinstance(anthropic_resp, dict) else []
+
+    function_models = await get_function_models(request)
+    models = function_models + openai_models + ollama_models + gemini_models + anthropic_models
+
+    return models
+
+
+async def get_all_base_models(request: Request, user: UserModel = None):
+    # Per-user short-TTL cache to avoid redundant provider API calls during rapid navigation.
+    # Cache is keyed by user_id (or "anon") and expires after _BASE_MODEL_CACHE_TTL seconds.
+    cache_key = user.id if user else "anon"
+    now = time.time()
+    cached = _base_model_cache.get(cache_key)
+    if cached:
+        ts, models = cached
+        if now - ts < _BASE_MODEL_CACHE_TTL:
+            return models
+
+    models = await _fetch_all_base_models(request, user=user)
+    _base_model_cache[cache_key] = (now, models)
+
+    # Evict stale entries to prevent memory growth
+    stale_keys = [k for k, (ts, _) in _base_model_cache.items() if now - ts > 120]
+    for k in stale_keys:
+        _base_model_cache.pop(k, None)
+
+    return models
+
+
+async def get_all_models(request, user: UserModel = None):
+    """
+    Return the effective model list for a given user.
+
+    This is user-scoped: it merges the user's provider base models (from their own connections)
+    with workspace models stored in the DB (Models table), including shared models owned by
+    other users that the caller has access to.
+
+    NOTE: This function intentionally does not write user-scoped model lists into app.state
+    to avoid cross-user leakage. Callers can use request.state.MODELS as a per-request cache.
+    """
+    base_models = await get_all_base_models(request, user=user)
+    models = copy.deepcopy(base_models)
+
+    # If there are no models, return an empty list
+    if len(models) == 0:
+        request.state.MODELS = {}
+        return []
+
+    global_action_ids = [
+        function.id for function in Functions.get_global_action_functions()
+    ]
+    enabled_action_ids = [
+        function.id
+        for function in Functions.get_functions_by_type("action", active_only=True)
+    ]
+
+    # Build quick indexes for matching.
+    model_by_id: dict[str, dict] = {m.get("id"): m for m in models if isinstance(m, dict) and m.get("id")}
+    model_ids = set(model_by_id.keys())
+
+    def _can_read_workspace_model(model_row) -> bool:
+        if not user:
+            return False
+        if user.role == "admin":
+            return True
+        if user.id == model_row.user_id:
+            return True
+        return has_access(user.id, type="read", access_control=model_row.access_control)
+
+    # For shared models (owned by other users), we may need to fetch a small subset of
+    # provider base model metadata from that owner's connections so we can route correctly.
+    async def _owner_base_models_by_user_id(user_id: str) -> list[dict]:
+        try:
+            from open_webui.models.users import Users  # local import to avoid heavy coupling
+
+            owner = Users.get_user_by_id(user_id)
+            if not owner:
+                return []
+            return await get_all_base_models(request, user=owner)
+        except Exception:
+            return []
+
+    owner_base_models_cache: dict[str, list[dict]] = {}
+
+    def _find_model_like(models_list: list[dict], model_id: str) -> Optional[dict]:
+        if not model_id:
+            return None
+        for m in models_list or []:
+            if not isinstance(m, dict):
+                continue
+            mid = m.get("id")
+            if mid == model_id:
+                return m
+            # Ollama ids can vary ('llama3' vs 'llama3:7b'); match on base name.
+            if m.get("owned_by") == "ollama" and isinstance(mid, str) and isinstance(model_id, str):
+                if model_id == mid.split(":")[0]:
+                    return m
+        return None
+
+    custom_models = Models.get_all_models()
+
+    # 1) Apply base model overrides (base_model_id == None).
+    for custom_model in custom_models:
+        if custom_model.base_model_id is not None:
+            continue
+
+        # Skip entries the caller can't see (for users).
+        if user and user.role == "user" and not _can_read_workspace_model(custom_model):
+            continue
+
+        existing = model_by_id.get(custom_model.id) or _find_model_like(models, custom_model.id)
+        if existing:
+            if custom_model.is_active:
+                existing["name"] = custom_model.name
+                existing["info"] = custom_model.model_dump()
+
+                action_ids = []
+                if "info" in existing and "meta" in existing["info"]:
+                    action_ids.extend(existing["info"]["meta"].get("actionIds", []))
+                existing["action_ids"] = action_ids
+            else:
+                try:
+                    models.remove(existing)
+                except Exception:
+                    pass
+                model_by_id.pop(custom_model.id, None)
+                model_ids.discard(custom_model.id)
+            continue
+
+        # Shared base model not present in this user's base model list. Inject it if active.
+        if not custom_model.is_active:
+            continue
+
+        owner_id = custom_model.user_id
+        if owner_id not in owner_base_models_cache:
+            owner_base_models_cache[owner_id] = await _owner_base_models_by_user_id(owner_id)
+
+        owner_base_model = _find_model_like(owner_base_models_cache.get(owner_id, []), custom_model.id)
+        if not owner_base_model:
+            # Fallback: still expose it, but routing may fail if we can't infer provider metadata.
+            owner_base_model = {
+                "id": custom_model.id,
+                "name": custom_model.name,
+                "object": "model",
+                "created": custom_model.created_at,
+                "owned_by": "openai",
+            }
+
+        injected = copy.deepcopy(owner_base_model)
+        injected["id"] = custom_model.id
+        injected["name"] = custom_model.name
+        injected["info"] = custom_model.model_dump()
+        injected["preset"] = True
+        models.append(injected)
+        model_by_id[injected["id"]] = injected
+        model_ids.add(injected["id"])
+
+    # 2) Append custom/preset models (base_model_id != None).
+    for custom_model in custom_models:
+        if custom_model.base_model_id is None or not custom_model.is_active:
+            continue
+
+        # Skip entries the caller can't see (for users).
+        if user and user.role == "user" and not _can_read_workspace_model(custom_model):
+            continue
+
+        if custom_model.id in model_ids:
+            continue
+
+        owned_by = "openai"
+        pipe = None
+        action_ids = []
+
+        base_like = _find_model_like(models, custom_model.base_model_id)  # user's own base models
+        if base_like is None and custom_model.user_id:
+            owner_id = custom_model.user_id
+            if owner_id not in owner_base_models_cache:
+                owner_base_models_cache[owner_id] = await _owner_base_models_by_user_id(owner_id)
+            base_like = _find_model_like(owner_base_models_cache.get(owner_id, []), custom_model.base_model_id)
+
+        if base_like:
+            owned_by = base_like.get("owned_by", owned_by)
+            if "pipe" in base_like:
+                pipe = base_like.get("pipe")
+
+        if custom_model.meta:
+            meta = custom_model.meta.model_dump()
+            if "actionIds" in meta:
+                action_ids.extend(meta["actionIds"])
+
+        models.append(
+            {
+                "id": f"{custom_model.id}",
+                "name": custom_model.name,
+                "object": "model",
+                "created": custom_model.created_at,
+                "owned_by": owned_by,
+                "info": custom_model.model_dump(),
+                "preset": True,
+                **({"pipe": pipe} if pipe is not None else {}),
+                "action_ids": action_ids,
+            }
+        )
+
+    # Process action_ids to get the actions
+    def get_action_items_from_module(function, module):
+        actions = []
+        if hasattr(module, "actions"):
+            actions = module.actions
+            return [
+                {
+                    "id": f"{function.id}.{action['id']}",
+                    "name": action.get("name", f"{function.name} ({action['id']})"),
+                    "description": function.meta.description,
+                    "icon_url": action.get(
+                        "icon_url", function.meta.manifest.get("icon_url", None)
+                    ),
+                }
+                for action in actions
+            ]
+        else:
+            return [
+                {
+                    "id": function.id,
+                    "name": function.name,
+                    "description": function.meta.description,
+                    "icon_url": function.meta.manifest.get("icon_url", None),
+                }
+            ]
+
+    def get_function_module_by_id(function_id):
+        if function_id in request.app.state.FUNCTIONS:
+            function_module = request.app.state.FUNCTIONS[function_id]
+        else:
+            function_module, _, _ = load_function_module_by_id(function_id)
+            request.app.state.FUNCTIONS[function_id] = function_module
+
+    for model in models:
+        action_ids = [
+            action_id
+            for action_id in list(set(model.pop("action_ids", []) + global_action_ids))
+            if action_id in enabled_action_ids
+        ]
+
+        model["actions"] = []
+        for action_id in action_ids:
+            action_function = Functions.get_function_by_id(action_id)
+            if action_function is None:
+                raise Exception(f"Action not found: {action_id}")
+
+            function_module = get_function_module_by_id(action_id)
+            model["actions"].extend(
+                get_action_items_from_module(action_function, function_module)
+            )
+    log.debug(f"get_all_models() returned {len(models)} models")
+
+    # Per-request model map (avoid leaking across users).
+    request.state.MODELS = {model["id"]: model for model in models if isinstance(model, dict) and model.get("id")}
+    return models
+
+
+def check_model_access(user, model):
+    model_info = Models.get_model_by_id(model.get("id"))
+    # Base models coming from a user's own external connections may not have a DB row.
+    # In that case, access is implicitly granted because the model list is already user-scoped.
+    if not model_info:
+        return True
+
+    if not (
+        user.id == model_info.user_id
+        or has_access(user.id, type="read", access_control=model_info.access_control)
+    ):
+        raise Exception("Model not found")
+    return True

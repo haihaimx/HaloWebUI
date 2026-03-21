@@ -1,0 +1,1618 @@
+import asyncio
+import hashlib
+import json
+import logging
+import secrets
+import time
+import uuid
+from pathlib import Path
+from typing import Literal, Optional, overload
+from urllib.parse import urlparse
+
+import aiohttp
+from aiocache import cached
+import requests
+
+
+from fastapi import Depends, FastAPI, HTTPException, Request, APIRouter
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
+from starlette.background import BackgroundTask
+
+from open_webui.models.models import Models
+from open_webui.config import (
+    CACHE_DIR,
+)
+from open_webui.env import (
+    AIOHTTP_CLIENT_TIMEOUT,
+    AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST,
+    ENABLE_FORWARD_USER_INFO_HEADERS,
+    BYPASS_MODEL_ACCESS_CONTROL,
+)
+from open_webui.models.users import UserModel
+from open_webui.utils.user_connections import (
+    get_user_connections,
+    set_user_connection_provider_config,
+)
+
+from open_webui.constants import ERROR_MESSAGES
+from open_webui.env import ENV, SRC_LOG_LEVELS
+
+
+from open_webui.utils.payload import (
+    apply_model_params_to_body_openai,
+    apply_model_system_prompt_to_body,
+)
+from open_webui.utils.misc import (
+    convert_logit_bias_input_to_json,
+)
+from open_webui.utils.openai_responses import (
+    convert_chat_completions_to_responses_payload,
+    convert_responses_to_chat_completions,
+    iter_responses_events,
+    responses_events_to_chat_completions_sse,
+)
+
+from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.access_control import has_access
+
+
+log = logging.getLogger(__name__)
+log.setLevel(SRC_LOG_LEVELS["OPENAI"])
+
+
+def _is_official_openai_connection(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").strip().lower()
+    except Exception:
+        host = ""
+    return host == "api.openai.com" or host.endswith(".openai.com")
+
+
+def _connection_supports_native_web_search(url: str, api_config: dict) -> bool:
+    explicit = api_config.get("native_web_search_enabled") if isinstance(api_config, dict) else None
+    if isinstance(explicit, bool):
+        return explicit
+    return _is_official_openai_connection(url)
+
+
+def _get_openai_user_config(connection_user: Optional[UserModel]) -> tuple[list[str], list[str], dict]:
+    """
+    Resolve OpenAI-compatible connection config for a given user.
+
+    Stored under user.settings.ui.connections.openai:
+      - OPENAI_API_BASE_URLS
+      - OPENAI_API_KEYS
+      - OPENAI_API_CONFIGS
+
+    Returns (base_urls, keys, configs).
+    """
+    conns = get_user_connections(connection_user)
+    cfg = conns.get("openai") if isinstance(conns, dict) else None
+    cfg = cfg if isinstance(cfg, dict) else {}
+
+    base_urls = list(cfg.get("OPENAI_API_BASE_URLS") or [])
+    keys = list(cfg.get("OPENAI_API_KEYS") or [])
+    configs = cfg.get("OPENAI_API_CONFIGS") or {}
+    configs = configs if isinstance(configs, dict) else {}
+
+    # Keep array lengths aligned (do not mutate user settings here).
+    if len(keys) != len(base_urls):
+        if len(keys) > len(base_urls):
+            keys = keys[: len(base_urls)]
+        else:
+            keys = keys + [""] * (len(base_urls) - len(keys))
+
+    return base_urls, keys, configs
+
+
+def _resolve_openai_connection_by_model_id(
+    model_id: str, base_urls: list[str], keys: list[str], cfgs: dict
+) -> tuple[int, str, str, dict]:
+    """
+    Pick a connection index based on an internal `prefix_id` embedded in the model id.
+
+    - If model_id is "prefix_id.xxx", we match that prefix against cfgs[idx].prefix_id.
+    - Otherwise we use idx=0.
+    """
+    chosen_idx = 0
+    chosen_cfg = (cfgs.get("0") or {}) if isinstance(cfgs, dict) else {}
+    chosen_prefix = (chosen_cfg.get("prefix_id") or "").strip() or None
+
+    if isinstance(model_id, str) and "." in model_id and len(base_urls) > 1 and isinstance(cfgs, dict):
+        maybe_prefix, _rest = model_id.split(".", 1)
+        for idx, _url in enumerate(base_urls):
+            c = cfgs.get(str(idx), {}) or {}
+            p = (c.get("prefix_id") or "").strip() or None
+            if p and p == maybe_prefix:
+                chosen_idx = idx
+                chosen_cfg = c
+                chosen_prefix = p
+                break
+
+    url = (base_urls[chosen_idx] if chosen_idx < len(base_urls) else "").rstrip("/")
+    key = keys[chosen_idx] if chosen_idx < len(keys) else ""
+    api_config = chosen_cfg or {}
+    api_config = {**api_config, "_resolved_prefix_id": chosen_prefix or ""}
+
+    return chosen_idx, url, key, api_config
+
+
+##########################################
+#
+# Utility functions
+#
+##########################################
+
+
+def _truncate_text(text: str, limit: int = 2000) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...(truncated)"
+
+
+def _stringify_upstream_body(body) -> str:
+    if body is None:
+        return ""
+    if isinstance(body, str):
+        return body
+    try:
+        return json.dumps(body, ensure_ascii=False, default=str)
+    except Exception:
+        return str(body)
+
+
+def _get_native_web_search_tool_type(api_config: dict) -> str:
+    """
+    Responses API web search tool types vary across providers/proxies.
+    Prefer explicit config, otherwise default to the canonical 'web_search'.
+    """
+    if not isinstance(api_config, dict):
+        return "web_search"
+
+    tool_types = api_config.get("native_web_search_tool_types")
+    if isinstance(tool_types, list):
+        for t in tool_types:
+            if t and str(t).strip():
+                return str(t).strip()
+
+    tool_type = api_config.get("native_web_search_tool_type")
+    if tool_type and str(tool_type).strip():
+        return str(tool_type).strip()
+
+    return "web_search"
+
+
+def _build_upstream_headers(
+    base_url: str,
+    key: str,
+    api_config: dict,
+    user: Optional[UserModel] = None,
+) -> dict:
+    headers: dict = {}
+
+    custom_headers = api_config.get("headers") if isinstance(api_config, dict) else None
+    if isinstance(custom_headers, dict):
+        for k, v in custom_headers.items():
+            if v is None:
+                continue
+            headers[str(k)] = str(v)
+
+    lower = {k.lower(): k for k in headers.keys()}
+
+    if key and ("authorization" not in lower) and ("api-key" not in lower):
+        headers["Authorization"] = f"Bearer {key}"
+
+    if "content-type" not in lower:
+        headers["Content-Type"] = "application/json"
+
+    if "openrouter.ai" in (base_url or ""):
+        if "http-referer" not in lower:
+            headers["HTTP-Referer"] = "https://openwebui.com/"
+        if "x-title" not in lower:
+            headers["X-Title"] = "Open WebUI"
+
+    if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+        for k, v in {
+            "X-OpenWebUI-User-Name": user.name,
+            "X-OpenWebUI-User-Id": user.id,
+            "X-OpenWebUI-User-Email": user.email,
+            "X-OpenWebUI-User-Role": user.role,
+        }.items():
+            if k.lower() not in lower:
+                headers[k] = v
+
+    return headers
+
+
+async def _safe_read_upstream_body(response: aiohttp.ClientResponse):
+    try:
+        return await response.json()
+    except Exception:
+        try:
+            return await response.text()
+        except Exception:
+            return None
+
+
+def _looks_like_responses_endpoint_unsupported(status: int, body_text: str) -> bool:
+    if status in (404, 405):
+        return True
+    text = (body_text or "").lower()
+    if "/responses" in text and ("not found" in text or "unknown" in text):
+        return True
+    if "unsupported" in text and "responses" in text:
+        return True
+    return False
+
+
+def _format_responses_upstream_error(
+    *,
+    request_url: str,
+    status: int,
+    body,
+) -> str:
+    host = ""
+    try:
+        host = urlparse(request_url).hostname or ""
+    except Exception:
+        host = ""
+
+    body_text = _truncate_text(_stringify_upstream_body(body), 2400)
+
+    hint = ""
+    if _looks_like_responses_endpoint_unsupported(status, body_text):
+        hint = (
+            "Hint: This upstream likely does not support the Responses API endpoint (/responses). "
+            "Disable 'Responses API' for this connection or switch upstream."
+        )
+
+    parts = [
+        f"Responses API upstream error ({status}){f' from {host}' if host else ''}.",
+        hint,
+        (f"Upstream response: {body_text}" if body_text else ""),
+    ]
+    return "\n".join([p for p in parts if p])
+
+
+async def error_sse_generator(message: str, *, code: str = "upstream_error"):
+    yield (
+        "data: "
+        + json.dumps(
+            {"error": {"message": message, "type": "api_error", "code": code}},
+            ensure_ascii=False,
+        )
+        + "\n\n"
+    )
+    yield "data: [DONE]\n\n"
+
+
+async def send_get_request(url, key=None, user: UserModel = None):
+    timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.get(
+                url,
+                headers={
+                    **({"Authorization": f"Bearer {key}"} if key else {}),
+                    **(
+                        {
+                            "X-OpenWebUI-User-Name": user.name,
+                            "X-OpenWebUI-User-Id": user.id,
+                            "X-OpenWebUI-User-Email": user.email,
+                            "X-OpenWebUI-User-Role": user.role,
+                        }
+                        if ENABLE_FORWARD_USER_INFO_HEADERS and user
+                        else {}
+                    ),
+                },
+            ) as response:
+                return await response.json()
+    except Exception as e:
+        # Handle connection error here
+        log.error(f"Connection error: {e}")
+        return None
+
+
+async def cleanup_response(
+    response: Optional[aiohttp.ClientResponse],
+    session: Optional[aiohttp.ClientSession],
+):
+    if response:
+        response.close()
+    if session:
+        await session.close()
+
+
+def openai_o1_o3_handler(payload):
+    """
+    Handle o1, o3 specific parameters
+    """
+    if "max_tokens" in payload:
+        # Remove "max_tokens" from the payload
+        payload["max_completion_tokens"] = payload["max_tokens"]
+        del payload["max_tokens"]
+
+    # Fix: o1 and o3 do not support the "system" role directly.
+    # For older models like "o1-mini" or "o1-preview", use role "user".
+    # For newer o1/o3 models, replace "system" with "developer".
+    if payload["messages"][0]["role"] == "system":
+        model_lower = payload["model"].lower()
+        if model_lower.startswith("o1-mini") or model_lower.startswith("o1-preview"):
+            payload["messages"][0]["role"] = "user"
+        else:
+            payload["messages"][0]["role"] = "developer"
+
+    return payload
+
+
+##########################################
+#
+# API routes
+#
+##########################################
+
+router = APIRouter()
+
+
+@router.get("/config")
+async def get_config(request: Request, user=Depends(get_admin_user)):
+    return {
+        "ENABLE_OPENAI_API": request.app.state.config.ENABLE_OPENAI_API,
+        "OPENAI_API_BASE_URLS": request.app.state.config.OPENAI_API_BASE_URLS,
+        "OPENAI_API_KEYS": request.app.state.config.OPENAI_API_KEYS,
+        "OPENAI_API_CONFIGS": request.app.state.config.OPENAI_API_CONFIGS,
+    }
+
+
+class OpenAIConfigForm(BaseModel):
+    ENABLE_OPENAI_API: Optional[bool] = None
+    OPENAI_API_BASE_URLS: list[str]
+    OPENAI_API_KEYS: list[str]
+    OPENAI_API_CONFIGS: dict
+
+
+@router.post("/config/update")
+async def update_config(
+    request: Request, form_data: OpenAIConfigForm, user=Depends(get_admin_user)
+):
+    # Preserve existing per-URL prefix_id to avoid breaking chats when admins edit connections.
+    # prefix_id is an internal stable identifier used for uniqueness/routing and should not be user-editable.
+    prev_urls = list(getattr(request.app.state.config, "OPENAI_API_BASE_URLS", []) or [])
+    prev_cfgs = getattr(request.app.state.config, "OPENAI_API_CONFIGS", {}) or {}
+    prev_prefix_by_url: dict[str, str] = {}
+    prev_empty_urls: set[str] = set()
+
+    for idx, prev_url in enumerate(prev_urls):
+        url_key = (prev_url or "").rstrip("/")
+        if not url_key:
+            continue
+        cfg = prev_cfgs.get(str(idx), prev_cfgs.get(prev_url, {})) or {}
+        raw = cfg.get("prefix_id", None)
+        prefix = (raw or "").strip() if isinstance(raw, str) else (str(raw).strip() if raw is not None else "")
+        if prefix:
+            prev_prefix_by_url.setdefault(url_key, prefix)
+        else:
+            prev_empty_urls.add(url_key)
+
+    request.app.state.config.ENABLE_OPENAI_API = form_data.ENABLE_OPENAI_API
+    request.app.state.config.OPENAI_API_BASE_URLS = form_data.OPENAI_API_BASE_URLS
+    request.app.state.config.OPENAI_API_KEYS = form_data.OPENAI_API_KEYS
+
+    # Check if API KEYS length is same than API URLS length
+    if len(request.app.state.config.OPENAI_API_KEYS) != len(
+        request.app.state.config.OPENAI_API_BASE_URLS
+    ):
+        if len(request.app.state.config.OPENAI_API_KEYS) > len(
+            request.app.state.config.OPENAI_API_BASE_URLS
+        ):
+            request.app.state.config.OPENAI_API_KEYS = (
+                request.app.state.config.OPENAI_API_KEYS[
+                    : len(request.app.state.config.OPENAI_API_BASE_URLS)
+                ]
+            )
+        else:
+            request.app.state.config.OPENAI_API_KEYS += [""] * (
+                len(request.app.state.config.OPENAI_API_BASE_URLS)
+                - len(request.app.state.config.OPENAI_API_KEYS)
+            )
+
+    request.app.state.config.OPENAI_API_CONFIGS = form_data.OPENAI_API_CONFIGS
+
+    # Remove the API configs that are not in the API URLS
+    keys = list(map(str, range(len(request.app.state.config.OPENAI_API_BASE_URLS))))
+    request.app.state.config.OPENAI_API_CONFIGS = {
+        key: value
+        for key, value in request.app.state.config.OPENAI_API_CONFIGS.items()
+        if key in keys
+    }
+
+    # Normalize configs:
+    # - add default name (display only)
+    # - ensure prefix_id uniqueness when present
+    # - preserve an empty prefix_id only if it already existed for a URL (backward compatibility)
+    used_prefix_ids = set()
+    normalized_configs = {}
+
+    preserved_empty_idx = None
+    if len(keys) >= 1:
+        for idx_str in keys:
+            idx = int(idx_str)
+            url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
+            url_key = (url or "").rstrip("/")
+            if url_key and url_key in prev_empty_urls:
+                preserved_empty_idx = idx
+                break
+
+    for idx_str in keys:
+        idx = int(idx_str)
+        url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
+        url_key = (url or "").rstrip("/")
+        cfg = request.app.state.config.OPENAI_API_CONFIGS.get(idx_str, {}) or {}
+
+        # User-facing name (display only)
+        name = (cfg.get("name") or "").strip()
+        if not name:
+            try:
+                parsed = urlparse(url)
+                name = parsed.hostname or f"Connection {idx + 1}"
+            except Exception:
+                name = f"Connection {idx + 1}"
+
+        # Internal prefix_id used for uniqueness/routing (hidden from users)
+        prev_prefix = prev_prefix_by_url.get(url_key) if url_key else None
+        prefix_id = (prev_prefix or (cfg.get("prefix_id") or "")).strip()
+        if not prefix_id:
+            if preserved_empty_idx == idx:
+                prefix_id = ""
+            elif len(keys) > 1:
+                prefix_id = secrets.token_hex(4)
+
+        if prefix_id:
+            while prefix_id in used_prefix_ids:
+                prefix_id = secrets.token_hex(4)
+            used_prefix_ids.add(prefix_id)
+
+        normalized_cfg = {**cfg, "name": name}
+        if prefix_id:
+            normalized_cfg["prefix_id"] = prefix_id
+        elif preserved_empty_idx == idx:
+            # Store explicit empty marker so runtime normalization can preserve this legacy "no prefix" connection.
+            normalized_cfg["prefix_id"] = ""
+        else:
+            # omit empty prefix_id to keep configs clean
+            normalized_cfg.pop("prefix_id", None)
+
+        normalized_configs[idx_str] = normalized_cfg
+
+    request.app.state.config.OPENAI_API_CONFIGS = normalized_configs
+
+    # Refresh model list cache when config changes
+    request.app.state.BASE_MODELS = None
+    request.app.state.OPENAI_MODELS = {}
+    request.app.state.MODELS = {}
+
+    return {
+        "ENABLE_OPENAI_API": request.app.state.config.ENABLE_OPENAI_API,
+        "OPENAI_API_BASE_URLS": request.app.state.config.OPENAI_API_BASE_URLS,
+        "OPENAI_API_KEYS": request.app.state.config.OPENAI_API_KEYS,
+        "OPENAI_API_CONFIGS": request.app.state.config.OPENAI_API_CONFIGS,
+    }
+
+
+@router.post("/audio/speech")
+async def speech(request: Request, user=Depends(get_verified_user)):
+    idx = None
+    try:
+        idx = request.app.state.config.OPENAI_API_BASE_URLS.index(
+            "https://api.openai.com/v1"
+        )
+
+        body = await request.body()
+        name = hashlib.sha256(body).hexdigest()
+
+        SPEECH_CACHE_DIR = CACHE_DIR / "audio" / "speech"
+        SPEECH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        file_path = SPEECH_CACHE_DIR.joinpath(f"{name}.mp3")
+        file_body_path = SPEECH_CACHE_DIR.joinpath(f"{name}.json")
+
+        # Check if the file already exists in the cache
+        if file_path.is_file():
+            return FileResponse(file_path)
+
+        url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
+
+        r = None
+        try:
+            r = requests.post(
+                url=f"{url}/audio/speech",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {request.app.state.config.OPENAI_API_KEYS[idx]}",
+                    **(
+                        {
+                            "HTTP-Referer": "https://openwebui.com/",
+                            "X-Title": "Open WebUI",
+                        }
+                        if "openrouter.ai" in url
+                        else {}
+                    ),
+                    **(
+                        {
+                            "X-OpenWebUI-User-Name": user.name,
+                            "X-OpenWebUI-User-Id": user.id,
+                            "X-OpenWebUI-User-Email": user.email,
+                            "X-OpenWebUI-User-Role": user.role,
+                        }
+                        if ENABLE_FORWARD_USER_INFO_HEADERS
+                        else {}
+                    ),
+                },
+                stream=True,
+            )
+
+            r.raise_for_status()
+
+            # Save the streaming content to a file
+            with open(file_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            with open(file_body_path, "w") as f:
+                json.dump(json.loads(body.decode("utf-8")), f)
+
+            # Return the saved file
+            return FileResponse(file_path)
+
+        except Exception as e:
+            log.exception(e)
+
+            detail = None
+            if r is not None:
+                try:
+                    res = r.json()
+                    if "error" in res:
+                        detail = f"External: {res['error']}"
+                except Exception:
+                    detail = f"External: {e}"
+
+            raise HTTPException(
+                status_code=r.status_code if r else 500,
+                detail=detail if detail else "Open WebUI: Server Connection Error",
+            )
+
+    except ValueError:
+        raise HTTPException(status_code=401, detail=ERROR_MESSAGES.OPENAI_NOT_FOUND)
+
+
+async def get_all_models_responses(request: Request, user: UserModel) -> list:
+    base_urls, keys, cfgs = _get_openai_user_config(user)
+    if not base_urls:
+        return []
+
+    num_urls = len(base_urls)
+
+    # If multiple OpenAI-compatible connections exist, ensure every connection has a stable internal prefix_id.
+    # This avoids id collisions and prevents UI crashes due to duplicate keyed list items.
+    cfgs = cfgs or {}
+    cfgs_changed = False
+    if num_urls > 1:
+        cfgs = dict(cfgs)
+        used = set()
+
+        preserved_empty_idx = None
+        # Prefer an explicit empty marker stored in config.
+        for idx, url in enumerate(base_urls):
+            api_config = cfgs.get(str(idx), cfgs.get(url, {})) or {}
+            if api_config.get("prefix_id", None) == "":
+                preserved_empty_idx = idx
+                break
+
+        # Backward compatibility: for legacy configs that omitted prefix_id, preserve empty for index 0.
+        if preserved_empty_idx is None and len(base_urls) >= 1:
+            url0 = base_urls[0]
+            cfg0 = cfgs.get("0", cfgs.get(url0, {})) or {}
+            if not (cfg0.get("prefix_id") or "").strip():
+                preserved_empty_idx = 0
+
+        for idx, url in enumerate(base_urls):
+            key = str(idx)
+            api_config = cfgs.get(key, cfgs.get(url, {})) or {}
+
+            name = (api_config.get("remark") or "").strip()
+            if not name:
+                try:
+                    name = urlparse(url).hostname or f"Connection {idx + 1}"
+                except Exception:
+                    name = f"Connection {idx + 1}"
+
+            prefix_id = (api_config.get("prefix_id") or "").strip()
+            if not prefix_id:
+                if preserved_empty_idx == idx:
+                    prefix_id = ""
+                else:
+                    prefix_id = secrets.token_hex(4)
+                    cfgs_changed = True
+
+            if prefix_id:
+                if prefix_id in used:
+                    # De-conflict duplicates (rare unless user copied configs manually).
+                    next_prefix = prefix_id
+                    while next_prefix in used:
+                        next_prefix = secrets.token_hex(4)
+                    prefix_id = next_prefix
+                    cfgs_changed = True
+                used.add(prefix_id)
+
+            next_cfg = {**api_config, "name": name}
+            if prefix_id:
+                if next_cfg.get("prefix_id") != prefix_id:
+                    cfgs_changed = True
+                next_cfg["prefix_id"] = prefix_id
+            elif preserved_empty_idx == idx:
+                # Store explicit empty marker.
+                if next_cfg.get("prefix_id") != "":
+                    cfgs_changed = True
+                next_cfg["prefix_id"] = ""
+            else:
+                if "prefix_id" in next_cfg:
+                    cfgs_changed = True
+                next_cfg.pop("prefix_id", None)
+
+            if cfgs.get(key) != next_cfg:
+                cfgs_changed = True
+            cfgs[key] = next_cfg
+
+    # Persist prefix_id/name normalization when needed (keeps model ids stable across sessions).
+    if cfgs_changed and user:
+        try:
+            set_user_connection_provider_config(
+                user.id,
+                "openai",
+                {
+                    "OPENAI_API_BASE_URLS": base_urls,
+                    "OPENAI_API_KEYS": keys,
+                    "OPENAI_API_CONFIGS": cfgs,
+                },
+            )
+        except Exception:
+            # Best-effort persistence; do not block model listing.
+            pass
+
+    request_tasks = []
+    for idx, url in enumerate(base_urls):
+        idx_key = str(idx)
+        api_config = cfgs.get(idx_key, cfgs.get(url, {})) or {}
+
+        enable = api_config.get("enable", True)
+        model_ids = api_config.get("model_ids", [])
+        prefix_id = (api_config.get("prefix_id") or "").strip() or None
+
+        if not enable:
+            request_tasks.append(asyncio.ensure_future(asyncio.sleep(0, None)))
+            continue
+
+        if model_ids:
+            # Users sometimes copy the internal prefixed model id back into the allowlist.
+            # Treat allowlisted entries as "original ids" and strip this connection's prefix if present.
+            if prefix_id:
+                prefix = f"{prefix_id}."
+                model_ids = [
+                    (m[len(prefix) :] if isinstance(m, str) and m.startswith(prefix) else m) for m in model_ids
+                ]
+
+            model_list = {
+                "object": "list",
+                "data": [
+                    {
+                        "id": model_id,
+                        "name": model_id,
+                        "owned_by": "openai",
+                        "openai": {"id": model_id},
+                        "urlIdx": idx,
+                    }
+                    for model_id in model_ids
+                ],
+            }
+
+            request_tasks.append(asyncio.ensure_future(asyncio.sleep(0, model_list)))
+            continue
+
+        request_tasks.append(
+            send_get_request(
+                f"{url}/models",
+                keys[idx] if idx < len(keys) else "",
+                user=user,
+            )
+        )
+
+    responses = await asyncio.gather(*request_tasks, return_exceptions=True)
+
+    # Degrade gracefully: a single bad connection (401/timeout/etc.) should not break the whole models list.
+    for idx, resp in enumerate(responses):
+        if isinstance(resp, BaseException):
+            url = base_urls[idx] if idx < len(base_urls) else ""
+            if isinstance(resp, HTTPException):
+                log.warning(
+                    f"[OPENAI] models fetch failed (idx={idx}, url={url}) "
+                    f"{resp.status_code}: {resp.detail}"
+                )
+            else:
+                log.warning(
+                    f"[OPENAI] models fetch failed (idx={idx}, url={url}) {type(resp).__name__}: {resp}"
+                )
+            responses[idx] = None
+
+    for idx, response in enumerate(responses):
+        if not response:
+            continue
+
+        url = base_urls[idx]
+        api_config = cfgs.get(str(idx), cfgs.get(url, {})) or {}
+        native_web_search_supported = _connection_supports_native_web_search(
+            url, api_config
+        )
+
+        prefix_id = (api_config.get("prefix_id") or "").strip() or None
+        connection_name = (api_config.get("remark") or "").strip()
+        if not connection_name:
+            try:
+                connection_name = urlparse(url).hostname or ""
+            except Exception:
+                connection_name = ""
+        tags = api_config.get("tags", [])
+        connection_icon = (api_config.get("icon") or "").strip()
+
+        for model in response if isinstance(response, list) else response.get("data", []):
+            original_id = model.get("id") or model.get("name") or ""
+
+            # Avoid showing/stacking internal prefixes in display names.
+            if prefix_id:
+                prefix = f"{prefix_id}."
+                if isinstance(original_id, str) and original_id.startswith(prefix):
+                    original_id = original_id[len(prefix) :]
+                display_name = model.get("name") or original_id
+                if isinstance(display_name, str) and display_name.startswith(prefix):
+                    display_name = display_name[len(prefix) :]
+            else:
+                display_name = model.get("name") or original_id
+
+            if connection_name:
+                model["connection_name"] = connection_name
+            if connection_icon:
+                model["connection_icon"] = connection_icon
+            model["name"] = display_name
+            model["native_web_search_supported"] = native_web_search_supported
+
+            if prefix_id:
+                model["original_id"] = original_id
+                model["id"] = f"{prefix_id}.{original_id}"
+
+        if tags:
+            for model in response if isinstance(response, list) else response.get("data", []):
+                model["tags"] = tags
+
+    log.debug(f"get_all_models:responses() {responses}")
+    return responses
+
+
+async def get_filtered_models(models, user):
+    # Filter models based on user access control
+    filtered_models = []
+    for model in models.get("data", []):
+        model_info = Models.get_model_by_id(model["id"])
+        if model_info:
+            if user.id == model_info.user_id or has_access(
+                user.id, type="read", access_control=model_info.access_control
+            ):
+                filtered_models.append(model)
+    return filtered_models
+
+
+async def get_all_models(request: Request, user: UserModel) -> dict[str, list]:
+    log.info("get_all_models()")
+
+    base_urls, _keys, _cfgs = _get_openai_user_config(user)
+    if not base_urls:
+        return {"data": []}
+
+    responses = await get_all_models_responses(request, user=user)
+
+    def extract_data(response):
+        if response and "data" in response:
+            return response["data"]
+        if isinstance(response, list):
+            return response
+        return None
+
+    def merge_models_lists(model_lists):
+        log.debug(f"merge_models_lists {model_lists}")
+        merged_list = []
+
+        for idx, models in enumerate(model_lists):
+            if models is not None and "error" not in models:
+
+                merged_list.extend(
+                    [
+                        {
+                            **model,
+                            "name": model.get("name", model["id"]),
+                            "owned_by": "openai",
+                            "openai": model,
+                            "urlIdx": idx,
+                        }
+                        for model in models
+                        if (model.get("id") or model.get("name"))
+                    ]
+                )
+
+        return merged_list
+
+    models = {"data": merge_models_lists(map(extract_data, responses))}
+    log.debug(f"models: {models}")
+    return models
+
+
+@router.get("/models")
+@router.get("/models/{url_idx}")
+async def get_models(
+    request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)
+):
+    models = {
+        "data": [],
+    }
+
+    if url_idx is None:
+        models = await get_all_models(request, user=user)
+    else:
+        base_urls, keys, _cfgs = _get_openai_user_config(user)
+        if url_idx < 0 or url_idx >= len(base_urls):
+            raise HTTPException(status_code=404, detail="Connection not found")
+
+        url = base_urls[url_idx]
+        key = keys[url_idx] if url_idx < len(keys) else ""
+
+        r = None
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST)
+        ) as session:
+            try:
+                async with session.get(
+                    f"{url}/models",
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                        **(
+                            {
+                                "X-OpenWebUI-User-Name": user.name,
+                                "X-OpenWebUI-User-Id": user.id,
+                                "X-OpenWebUI-User-Email": user.email,
+                                "X-OpenWebUI-User-Role": user.role,
+                            }
+                            if ENABLE_FORWARD_USER_INFO_HEADERS
+                            else {}
+                        ),
+                    },
+                ) as r:
+                    if r.status != 200:
+                        # Extract response error details if available
+                        error_detail = f"HTTP Error: {r.status}"
+                        res = await r.json()
+                        if "error" in res:
+                            error_detail = f"External Error: {res['error']}"
+                        raise Exception(error_detail)
+
+                    response_data = await r.json()
+
+                    # Check if we're calling OpenAI API based on the URL
+                    if "api.openai.com" in url:
+                        # Filter models according to the specified conditions
+                        response_data["data"] = [
+                            model
+                            for model in response_data.get("data", [])
+                            if not any(
+                                name in model["id"]
+                                for name in [
+                                    "babbage",
+                                    "dall-e",
+                                    "davinci",
+                                    "embedding",
+                                    "tts",
+                                    "whisper",
+                                ]
+                            )
+                        ]
+
+                    models = response_data
+            except aiohttp.ClientError as e:
+                # ClientError covers all aiohttp requests issues
+                log.exception(f"Client error: {str(e)}")
+                raise HTTPException(
+                    status_code=500, detail="Open WebUI: Server Connection Error"
+                )
+            except Exception as e:
+                log.exception(f"Unexpected error: {e}")
+                error_detail = f"Unexpected error: {str(e)}"
+                raise HTTPException(status_code=500, detail=error_detail)
+
+    if user.role == "user" and not BYPASS_MODEL_ACCESS_CONTROL:
+        models["data"] = await get_filtered_models(models, user)
+
+    return models
+
+
+class ConnectionVerificationForm(BaseModel):
+    url: str
+    key: str
+
+
+class ResponsesVerificationForm(BaseModel):
+    url: str
+    key: str = ""
+    headers: Optional[dict] = None
+    model: Optional[str] = None
+
+
+@router.post("/verify")
+async def verify_connection(
+    form_data: ConnectionVerificationForm, user=Depends(get_verified_user)
+):
+    url = form_data.url
+    key = form_data.key
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST)
+    ) as session:
+        try:
+            async with session.get(
+                f"{url}/models",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    **(
+                        {
+                            "X-OpenWebUI-User-Name": user.name,
+                            "X-OpenWebUI-User-Id": user.id,
+                            "X-OpenWebUI-User-Email": user.email,
+                            "X-OpenWebUI-User-Role": user.role,
+                        }
+                        if ENABLE_FORWARD_USER_INFO_HEADERS
+                        else {}
+                    ),
+                },
+            ) as r:
+                if r.status != 200:
+                    # Extract response error details if available
+                    error_detail = f"HTTP Error: {r.status}"
+                    res = await r.json()
+                    if "error" in res:
+                        error_detail = f"External Error: {res['error']}"
+                    raise Exception(error_detail)
+
+                response_data = await r.json()
+                return response_data
+
+        except aiohttp.ClientError as e:
+            # ClientError covers all aiohttp requests issues
+            log.exception(f"Client error: {str(e)}")
+            raise HTTPException(
+                status_code=500, detail="Open WebUI: Server Connection Error"
+            )
+        except Exception as e:
+            log.exception(f"Unexpected error: {e}")
+            error_detail = f"Unexpected error: {str(e)}"
+            raise HTTPException(status_code=500, detail=error_detail)
+
+
+@router.post("/verify_responses")
+async def verify_responses_connection(
+    form_data: ResponsesVerificationForm, user=Depends(get_admin_user)
+):
+    """
+    Verifies whether the upstream supports POST {base}/responses.
+
+    Important: This endpoint does NOT fall back to /chat/completions.
+    """
+    url = (form_data.url or "").rstrip("/")
+    key = form_data.key or ""
+
+    # Merge provided headers with defaults.
+    api_config = {"headers": form_data.headers or {}}
+    headers = _build_upstream_headers(url, key, api_config, user=user)
+
+    chosen_model = form_data.model
+    models_error = None
+
+    # Try to discover a model via /models so we don't misclassify "model not found"
+    # as "responses not supported".
+    if not chosen_model:
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST),
+                trust_env=True,
+            ) as session:
+                async with session.get(f"{url}/models", headers=headers) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        items = data.get("data") if isinstance(data, dict) else None
+                        if isinstance(items, list) and items:
+                            first = items[0]
+                            if isinstance(first, dict):
+                                chosen_model = first.get("id") or first.get("name")
+                    else:
+                        models_error = await _safe_read_upstream_body(r)
+        except Exception as e:
+            models_error = str(e)
+
+    if not chosen_model:
+        # Use a placeholder; response is still useful for detecting 404/405 endpoint errors.
+        chosen_model = "gpt-4o-mini"
+
+    request_url = f"{url}/responses"
+    payload = {
+        "model": chosen_model,
+        "input": [{"role": "user", "content": "ping"}],
+        "stream": False,
+    }
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST),
+        trust_env=True,
+    ) as session:
+        async with session.post(
+            request_url,
+            headers=headers,
+            data=json.dumps(payload),
+        ) as r:
+            body = await _safe_read_upstream_body(r)
+
+            body_text = _stringify_upstream_body(body)
+            supports_responses = r.status < 400 and isinstance(body, dict)
+            endpoint_supported = None if supports_responses else not _looks_like_responses_endpoint_unsupported(r.status, body_text)
+
+            return {
+                "ok": supports_responses,
+                "supports_responses": supports_responses,
+                "endpoint_supported_guess": endpoint_supported,
+                "status": r.status,
+                "model_used": chosen_model,
+                "models_probe_error": models_error,
+                "upstream_body_preview": _truncate_text(body_text, 1200),
+            }
+
+
+@router.post("/chat/completions")
+async def generate_chat_completion(
+    request: Request,
+    form_data: dict,
+    user=Depends(get_verified_user),
+    bypass_filter: Optional[bool] = False,
+):
+    if BYPASS_MODEL_ACCESS_CONTROL:
+        bypass_filter = True
+
+    idx = 0
+
+    payload = {**form_data}
+    metadata = payload.pop("metadata", None)
+
+    model_id = form_data.get("model")
+    model_info = Models.get_model_by_id(model_id)
+
+    # Check model info and override the payload
+    if model_info:
+        if model_info.base_model_id:
+            payload["model"] = model_info.base_model_id
+            model_id = model_info.base_model_id
+
+        params = model_info.params.model_dump()
+        payload = apply_model_params_to_body_openai(params, payload)
+        payload = apply_model_system_prompt_to_body(params, payload, metadata, user)
+
+        # Check if user has access to the model
+        if not bypass_filter and user.role == "user":
+            if not (
+                user.id == model_info.user_id
+                or has_access(
+                    user.id, type="read", access_control=model_info.access_control
+                )
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Model not found",
+                )
+    elif not bypass_filter:
+        if user.role != "admin":
+            raise HTTPException(
+                status_code=403,
+                detail="Model not found",
+            )
+
+    # Resolve connection config from the *connection owner* (defaults to the requester).
+    connection_user = getattr(getattr(request, "state", None), "connection_user", None) or user
+    base_urls, keys, cfgs = _get_openai_user_config(connection_user)
+    if not base_urls:
+        raise HTTPException(status_code=404, detail="No connections configured")
+
+    idx, url, key, api_config = _resolve_openai_connection_by_model_id(model_id, base_urls, keys, cfgs)
+    if not url:
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    prefix_id = api_config.get("prefix_id", None)
+    if prefix_id and isinstance(payload.get("model"), str):
+        prefix = f"{prefix_id}."
+        if payload["model"].startswith(prefix):
+            payload["model"] = payload["model"][len(prefix) :]
+
+    url = (url or "").rstrip("/")
+    key = key or ""
+
+    # Local-only flags (do not forward as-is).
+    native_web_search = payload.pop("native_web_search", False) is True
+
+    # Responses API routing is strict: if enabled, we only call /responses and surface real errors.
+    use_responses_api = bool(api_config.get("use_responses_api", False) or native_web_search)
+    if use_responses_api and not native_web_search:
+        exclude_patterns = api_config.get("responses_api_exclude_patterns", [])
+        if isinstance(exclude_patterns, list):
+            model_lower = (model_id or "").lower()
+            if any(
+                isinstance(p, str) and p.strip() and p.strip().lower() in model_lower
+                for p in exclude_patterns
+            ):
+                use_responses_api = False
+
+    request_url = f"{url}/responses" if use_responses_api else f"{url}/chat/completions"
+
+    # Build headers (supports per-connection custom headers).
+    headers = _build_upstream_headers(url, key, api_config, user=user)
+
+    payload_dict = None
+    if use_responses_api:
+        web_search_tool_type = _get_native_web_search_tool_type(api_config) if native_web_search else None
+        payload_dict = convert_chat_completions_to_responses_payload(
+            payload,
+            native_web_search_tool_type=web_search_tool_type,
+        )
+
+        # Responses API: keep to standard fields; conversion already filters most chat-only fields.
+    else:
+        # Chat Completions compatibility adjustments.
+        # Fix: o1,o3 do not support the "max_tokens" parameter; use max_completion_tokens.
+        is_o1_o3 = payload["model"].lower().startswith(("o1", "o3-"))
+        if is_o1_o3:
+            payload = openai_o1_o3_handler(payload)
+        elif "api.openai.com" not in url:
+            # Remove "max_completion_tokens" from the payload for backward compatibility.
+            if "max_completion_tokens" in payload:
+                payload["max_tokens"] = payload["max_completion_tokens"]
+                del payload["max_completion_tokens"]
+
+        if "max_tokens" in payload and "max_completion_tokens" in payload:
+            del payload["max_tokens"]
+
+        if "logit_bias" in payload:
+            payload["logit_bias"] = json.loads(
+                convert_logit_bias_input_to_json(payload["logit_bias"])
+            )
+
+        payload_dict = payload
+
+    payload_json = json.dumps(payload_dict, ensure_ascii=False, default=str)
+
+    # ── Diagnostic logging: key info at INFO, details at DEBUG ──
+    _diag_keys = sorted(payload_dict.keys()) if isinstance(payload_dict, dict) else "N/A"
+    _msg_count = len(payload_dict.get("messages", [])) if isinstance(payload_dict, dict) else "?"
+    _tools_count = len(payload_dict.get("tools", [])) if isinstance(payload_dict, dict) and payload_dict.get("tools") else 0
+    log.info(
+        "[UPSTREAM REQUEST] POST %s | model=%s | payload_keys=%s | messages=%s | tools=%s | size=%d",
+        request_url,
+        payload_dict.get("model", "?") if isinstance(payload_dict, dict) else "?",
+        _diag_keys,
+        _msg_count,
+        _tools_count,
+        len(payload_json),
+    )
+    if log.isEnabledFor(logging.DEBUG):
+        _diag_headers = {
+            k: ("***" if k.lower() in ("authorization", "api-key") else v)
+            for k, v in headers.items()
+        }
+        log.debug("[UPSTREAM REQUEST] headers=%s", _diag_headers)
+        # Log full payload (truncate messages content to keep log readable)
+        if isinstance(payload_dict, dict):
+            _diag_payload = {**payload_dict}
+            if "messages" in _diag_payload:
+                _diag_msgs = []
+                for m in _diag_payload["messages"]:
+                    _dm = {**m} if isinstance(m, dict) else m
+                    if isinstance(_dm, dict) and isinstance(_dm.get("content"), str) and len(_dm["content"]) > 200:
+                        _dm["content"] = _dm["content"][:200] + f"...[truncated, total {len(m['content'])} chars]"
+                    _diag_msgs.append(_dm)
+                _diag_payload["messages"] = _diag_msgs
+            if "tools" in _diag_payload and _diag_payload["tools"]:
+                _diag_payload["tools"] = f"[{len(_diag_payload['tools'])} tools, omitted]"
+            log.debug("[UPSTREAM REQUEST] payload=%s", json.dumps(_diag_payload, ensure_ascii=False, default=str)[:4000])
+
+    r = None
+    session = None
+    streaming = False
+    response = None
+
+    try:
+        session = aiohttp.ClientSession(
+            trust_env=True,
+            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+        )
+
+        r = await session.request(
+            method="POST",
+            url=request_url,
+            data=payload_json,
+            headers=headers,
+        )
+
+        # ── Log upstream response metadata ──
+        log.info(
+            "[UPSTREAM RESPONSE] status=%d | content-type=%s",
+            r.status,
+            r.headers.get("Content-Type", ""),
+        )
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "[UPSTREAM RESPONSE] headers=%s",
+                {k: v for k, v in r.headers.items() if k.lower() not in ("set-cookie",)},
+            )
+
+        # ── Non-2xx response on Chat Completions path: log body for diagnosis ──
+        if not use_responses_api and r.status >= 400:
+            error_body = await r.text()
+            log.warning(
+                "[UPSTREAM ERROR] status=%d | url=%s | body=%s",
+                r.status, request_url, error_body[:2000],
+            )
+            # Re-create the response for downstream processing (body already consumed)
+            # We'll let the existing error handling below deal with it.
+
+        # Responses API handling (strict mode).
+        if use_responses_api:
+            client_stream = bool(payload_dict.get("stream"))
+            content_type = r.headers.get("Content-Type", "") or ""
+            looks_streaming = any(
+                t in content_type.lower()
+                for t in ("text/event-stream", "application/x-ndjson", "application/ndjson", "application/jsonl")
+            )
+
+            if r.status >= 400:
+                response = await _safe_read_upstream_body(r)
+                message = _format_responses_upstream_error(
+                    request_url=request_url, status=r.status, body=response
+                )
+
+                if client_stream:
+                    streaming = True
+                    return StreamingResponse(
+                        error_sse_generator(message, code="responses_api_error"),
+                        media_type="text/event-stream",
+                        status_code=200,
+                        background=BackgroundTask(
+                            cleanup_response, response=r, session=session
+                        ),
+                    )
+
+                raise HTTPException(status_code=r.status, detail=message)
+
+            # Stream conversion: upstream Responses events -> ChatCompletions SSE for frontend.
+            if client_stream and looks_streaming:
+                streaming = True
+                events = iter_responses_events(
+                    r.content.iter_any(), content_type=content_type
+                )
+                sse_iter = responses_events_to_chat_completions_sse(
+                    events, model_id=model_id
+                )
+                return StreamingResponse(
+                    sse_iter,
+                    media_type="text/event-stream",
+                    status_code=200,
+                    background=BackgroundTask(
+                        cleanup_response, response=r, session=session
+                    ),
+                )
+
+            # If the client asked for streaming but upstream returned non-stream JSON,
+            # convert to a minimal ChatCompletions SSE (single-shot). This is NOT an endpoint fallback.
+            response = await _safe_read_upstream_body(r)
+            if not isinstance(response, dict):
+                raise HTTPException(
+                    status_code=502,
+                    detail=_format_responses_upstream_error(
+                        request_url=request_url, status=502, body=response
+                    ),
+                )
+
+            cc = convert_responses_to_chat_completions(response, model_id=model_id)
+            if client_stream:
+                streaming = True
+                stream_id = cc.get("id") or f"chatcmpl-{uuid.uuid4().hex}"
+                created = cc.get("created") or int(time.time())
+
+                async def one_shot_sse():
+                    try:
+                        choice0 = (cc.get("choices") or [{}])[0] if isinstance(cc.get("choices"), list) else {}
+                        msg = choice0.get("message") or {}
+                        content = msg.get("content") or ""
+                        tool_calls = msg.get("tool_calls")
+                        delta = {}
+                        if content:
+                            delta["content"] = content
+                        if tool_calls:
+                            delta["tool_calls"] = tool_calls
+                        yield (
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "id": stream_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
+                        yield (
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "id": stream_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {},
+                                            "finish_reason": "tool_calls" if tool_calls else "stop",
+                                        }
+                                    ],
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
+                    finally:
+                        yield "data: [DONE]\n\n"
+
+                return StreamingResponse(
+                    one_shot_sse(),
+                    media_type="text/event-stream",
+                    status_code=200,
+                    background=BackgroundTask(
+                        cleanup_response, response=r, session=session
+                    ),
+                )
+
+            return cc
+
+        # Chat Completions: passthrough SSE or JSON.
+        if "text/event-stream" in r.headers.get("Content-Type", ""):
+            streaming = True
+
+            # Always wrap body iterator to log SSE lines for diagnosis.
+            _orig_content = r.content
+
+            async def _logging_sse_iterator():
+                _line_count = 0
+                _data_count = 0
+                _first_data_line = None
+                _last_data_line = None
+                _last_finish_reason = None
+                _last_usage = None
+                _total_content_len = 0
+
+                # Use iter_any() to avoid aiohttp's readline() buffer
+                # limit which crashes on large SSE lines (e.g. base64
+                # images from Gemini).  We accumulate a byte buffer and
+                # split on b'\n' ourselves, yielding complete lines to
+                # the downstream middleware.
+                _buf = b""
+                async for raw in _orig_content.iter_any():
+                    _buf += raw
+                    # Split on newline – may produce multiple lines per
+                    # raw chunk, or none if the line is still incomplete.
+                    while b"\n" in _buf:
+                        line_bytes, _buf = _buf.split(b"\n", 1)
+                        line_bytes += b"\n"  # restore the delimiter the downstream expects
+
+                        _line_count += 1
+                        _text = line_bytes.decode("utf-8", errors="replace")
+                        _stripped = _text.strip()
+
+                        # Log first 3 lines always
+                        if _line_count <= 3:
+                            log.info("[SSE RAW %d] %s", _line_count, _stripped[:500])
+
+                        # Parse data lines for diagnostics
+                        if _stripped.startswith("data:") and _stripped != "data: [DONE]":
+                            _data_count += 1
+                            _last_data_line = _stripped[:500]
+                            if _first_data_line is None:
+                                _first_data_line = _stripped[:500]
+                            try:
+                                _payload = json.loads(_stripped[5:].strip())
+                                _choices = _payload.get("choices", [])
+                                if _choices and isinstance(_choices[0], dict):
+                                    _c0 = _choices[0]
+                                    _fr = _c0.get("finish_reason")
+                                    if _fr is not None:
+                                        _last_finish_reason = _fr
+                                    _delta = _c0.get("delta", {}) or {}
+                                    _ct = _delta.get("content")
+                                    if _ct:
+                                        _total_content_len += len(_ct)
+                                _u = _payload.get("usage")
+                                if isinstance(_u, dict) and _u:
+                                    _last_usage = _u
+                            except Exception:
+                                pass
+
+                            if _data_count <= 3 or _data_count % 20 == 0:
+                                log.info(
+                                    "[SSE DATA #%d] finish_reason=%s content_so_far=%d chunk=%s",
+                                    _data_count, _last_finish_reason, _total_content_len,
+                                    _stripped[:200],
+                                )
+                            else:
+                                log.debug("[SSE DATA #%d] %s", _data_count, _stripped[:300])
+
+                        elif _stripped == "data: [DONE]":
+                            log.info("[SSE] Received data: [DONE]")
+
+                        yield line_bytes
+
+                # Flush any remaining data without a trailing newline
+                if _buf:
+                    _line_count += 1
+                    yield _buf
+
+                # Final summary — always INFO
+                log.info(
+                    "[SSE DONE] total_lines=%d data_events=%d "
+                    "finish_reason=%s content_len=%d usage=%s",
+                    _line_count, _data_count,
+                    _last_finish_reason, _total_content_len,
+                    json.dumps(_last_usage, ensure_ascii=False)[:300] if _last_usage else "(none)",
+                )
+                if _last_data_line:
+                    log.info("[SSE LAST DATA] %s", _last_data_line[:500])
+                if _last_finish_reason and _last_finish_reason != "stop":
+                    log.warning(
+                        "[SSE ABNORMAL FINISH] finish_reason=%s — "
+                        "response may be truncated! content_len=%d",
+                        _last_finish_reason, _total_content_len,
+                    )
+
+            return StreamingResponse(
+                _logging_sse_iterator(),
+                status_code=r.status,
+                headers=dict(r.headers),
+                background=BackgroundTask(
+                    cleanup_response, response=r, session=session
+                ),
+            )
+
+        # Non-streaming JSON response
+        try:
+            response = await r.json()
+        except Exception as e:
+            log.error(e)
+            response = await r.text()
+
+        if log.isEnabledFor(logging.DEBUG):
+            _resp_preview = json.dumps(response, ensure_ascii=False, default=str)[:2000] if isinstance(response, dict) else str(response)[:2000]
+            log.debug("[UPSTREAM RESPONSE BODY] %s", _resp_preview)
+
+        r.raise_for_status()
+        return response
+    except Exception as e:
+        log.exception(e)
+
+        detail = None
+        if isinstance(response, dict):
+            if "error" in response:
+                detail = f"{response['error']['message'] if 'message' in response['error'] else response['error']}"
+        elif isinstance(response, str):
+            detail = response
+
+        raise HTTPException(
+            status_code=r.status if r else 500,
+            detail=detail if detail else "Open WebUI: Server Connection Error",
+        )
+    finally:
+        if not streaming and session:
+            if r:
+                r.close()
+            await session.close()
+
+
+@router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
+    """
+    Deprecated: proxy all requests to OpenAI API
+    """
+
+    body = await request.body()
+
+    idx = 0
+    url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
+    key = request.app.state.config.OPENAI_API_KEYS[idx]
+
+    r = None
+    session = None
+    streaming = False
+
+    try:
+        session = aiohttp.ClientSession(trust_env=True)
+        r = await session.request(
+            method=request.method,
+            url=f"{url}/{path}",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                **(
+                    {
+                        "X-OpenWebUI-User-Name": user.name,
+                        "X-OpenWebUI-User-Id": user.id,
+                        "X-OpenWebUI-User-Email": user.email,
+                        "X-OpenWebUI-User-Role": user.role,
+                    }
+                    if ENABLE_FORWARD_USER_INFO_HEADERS
+                    else {}
+                ),
+            },
+        )
+        r.raise_for_status()
+
+        # Check if response is SSE
+        if "text/event-stream" in r.headers.get("Content-Type", ""):
+            streaming = True
+            return StreamingResponse(
+                r.content,
+                status_code=r.status,
+                headers=dict(r.headers),
+                background=BackgroundTask(
+                    cleanup_response, response=r, session=session
+                ),
+            )
+        else:
+            response_data = await r.json()
+            return response_data
+
+    except Exception as e:
+        log.exception(e)
+
+        detail = None
+        if r is not None:
+            try:
+                res = await r.json()
+                log.error(res)
+                if "error" in res:
+                    detail = f"External: {res['error']['message'] if 'message' in res['error'] else res['error']}"
+            except Exception:
+                detail = f"External: {e}"
+        raise HTTPException(
+            status_code=r.status if r else 500,
+            detail=detail if detail else "Open WebUI: Server Connection Error",
+        )
+    finally:
+        if not streaming and session:
+            if r:
+                r.close()
+            await session.close()

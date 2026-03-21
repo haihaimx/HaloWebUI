@@ -1,0 +1,9 @@
+-r base.txt
+-r vector-extra.txt
+-r rag-local.txt
+-r rerank-local.txt
+-r audio-local.txt
+-r docs-local.txt
+-r web-playwright.txt
+-r storage-cloud.txt
+-r telemetry.txt

@@ -1,0 +1,88 @@
+@import 'tailwindcss';
+
+@config '../tailwind.config.js';
+
+/* HarmonyOS Sans 鸿蒙字体 */
+@font-face {
+	font-family: 'HarmonyOS Sans SC';
+	src: url('/assets/fonts/HarmonyOS_SansSC_Regular.woff2') format('woff2');
+	font-weight: 400;
+	font-style: normal;
+	font-display: block;
+}
+
+@font-face {
+	font-family: 'HarmonyOS Sans SC';
+	src: url('/assets/fonts/HarmonyOS_SansSC_Medium.woff2') format('woff2');
+	font-weight: 500;
+	font-style: normal;
+	font-display: block;
+}
+
+@font-face {
+	font-family: 'HarmonyOS Sans SC';
+	src: url('/assets/fonts/HarmonyOS_SansSC_Bold.woff2') format('woff2');
+	font-weight: 700;
+	font-style: normal;
+	font-display: block;
+}
+
+/*
+  The default border color has changed to `currentColor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+	*,
+	::after,
+	::before,
+	::backdrop,
+	::file-selector-button {
+		border-color: var(--color-gray-200, currentColor);
+	}
+}
+
+@layer base {
+	html,
+	pre {
+		font-family:
+			'HarmonyOS Sans SC',
+			-apple-system,
+			BlinkMacSystemFont,
+			'PingFang SC',
+			'Inter',
+			ui-sans-serif,
+			system-ui,
+			'Segoe UI',
+			Roboto,
+			'Helvetica Neue',
+			Arial,
+			'Noto Sans',
+			'Hiragino Sans GB',
+			'Microsoft YaHei',
+			'WenQuanYi Micro Hei',
+			sans-serif,
+			'Apple Color Emoji',
+			'Segoe UI Emoji',
+			'Segoe UI Symbol',
+			'Noto Color Emoji';
+	}
+
+	pre {
+		white-space: pre-wrap;
+	}
+
+	button {
+		@apply cursor-pointer;
+	}
+
+	input::placeholder,
+	textarea::placeholder {
+		color: theme(--color-gray-400);
+	}
+}
+
+@custom-variant hover (&:hover);
