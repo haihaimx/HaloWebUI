@@ -4,7 +4,7 @@
   <p><strong>自托管 AI 平台 · 多模型路由 · 知识检索增强 · 全链路可控</strong></p>
   <p>
     基于 Open WebUI 深度定制，原生集成 Anthropic Claude / Google Gemini / xAI Grok，<br/>
-    内置 AnyRouter 智能路由与 HaloClaw 消息网关，一站式管理你的所有大模型。
+    内置 HaloClaw 消息网关，一站式管理你的所有大模型。
   </p>
 
   <br/>
