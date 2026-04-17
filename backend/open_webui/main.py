@@ -67,6 +67,7 @@ from open_webui.routers import (
     ollama,
     openai,
     gemini,
+    grok,
     anthropic,
     retrieval,
     tasks,
@@ -118,8 +119,12 @@ from open_webui.config import (
     OLLAMA_API_CONFIGS,
     # OpenAI
     ENABLE_OPENAI_API,
+    ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION,
+    CHAT_STREAM_RESPONSE_CHUNK_MAX_BUFFER_SIZE,
     # Gemini
     ENABLE_GEMINI_API,
+    # Grok
+    ENABLE_GROK_API,
     ONEDRIVE_CLIENT_ID,
     OPENAI_API_BASE_URLS,
     OPENAI_API_KEYS,
@@ -127,6 +132,9 @@ from open_webui.config import (
     GEMINI_API_BASE_URLS,
     GEMINI_API_KEYS,
     GEMINI_API_CONFIGS,
+    GROK_API_BASE_URLS,
+    GROK_API_KEYS,
+    GROK_API_CONFIGS,
     # Anthropic
     ENABLE_ANTHROPIC_API,
     ANTHROPIC_API_BASE_URLS,
@@ -662,6 +670,12 @@ app.state.config.ENABLE_OPENAI_API = ENABLE_OPENAI_API
 app.state.config.OPENAI_API_BASE_URLS = OPENAI_API_BASE_URLS
 app.state.config.OPENAI_API_KEYS = OPENAI_API_KEYS
 app.state.config.OPENAI_API_CONFIGS = OPENAI_API_CONFIGS
+app.state.config.ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION = (
+    ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION
+)
+app.state.config.CHAT_STREAM_RESPONSE_CHUNK_MAX_BUFFER_SIZE = (
+    CHAT_STREAM_RESPONSE_CHUNK_MAX_BUFFER_SIZE
+)
 
 app.state.OPENAI_MODELS = {}
 
@@ -678,6 +692,19 @@ app.state.config.GEMINI_API_KEYS = GEMINI_API_KEYS
 app.state.config.GEMINI_API_CONFIGS = GEMINI_API_CONFIGS
 
 app.state.GEMINI_MODELS = {}
+
+########################################
+#
+# GROK
+#
+########################################
+
+app.state.config.ENABLE_GROK_API = ENABLE_GROK_API
+app.state.config.GROK_API_BASE_URLS = GROK_API_BASE_URLS
+app.state.config.GROK_API_KEYS = GROK_API_KEYS
+app.state.config.GROK_API_CONFIGS = GROK_API_CONFIGS
+
+app.state.GROK_MODELS = {}
 
 ########################################
 #
@@ -1287,6 +1314,7 @@ app.mount("/ws", socket_app)
 app.include_router(ollama.router, prefix="/ollama", tags=["ollama"])
 app.include_router(openai.router, prefix="/openai", tags=["openai"])
 app.include_router(gemini.router, prefix="/gemini", tags=["gemini"])
+app.include_router(grok.router, prefix="/grok", tags=["grok"])
 app.include_router(anthropic.router, prefix="/anthropic", tags=["anthropic"])
 
 

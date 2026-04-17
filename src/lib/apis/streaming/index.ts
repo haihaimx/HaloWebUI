@@ -107,6 +107,51 @@ const consumeImageUrlDelta = (
 	};
 };
 
+const collectImageUrlDeltas = (
+	delta: any,
+	startSequence: number
+): { updates: StreamedImageUpdate[]; nextSequence: number } => {
+	const updates: StreamedImageUpdate[] = [];
+	const seen = new Set<string>();
+
+	const appendCandidate = (candidate: any) => {
+		const update = consumeImageUrlDelta(candidate, startSequence + updates.length);
+		if (!update || seen.has(update.markdown)) {
+			return;
+		}
+		seen.add(update.markdown);
+		updates.push(update);
+	};
+
+	appendCandidate(delta?.image_url);
+
+	const rawImages = Array.isArray(delta?.images)
+		? delta.images
+		: delta?.images && typeof delta.images === 'object'
+			? [delta.images]
+			: [];
+
+	if (rawImages.length > 0) {
+		for (const imageItem of rawImages) {
+			if (typeof imageItem === 'string') {
+				appendCandidate(imageItem);
+				continue;
+			}
+
+			if (!imageItem || typeof imageItem !== 'object') {
+				continue;
+			}
+
+			appendCandidate(imageItem.image_url ?? imageItem.url ?? imageItem);
+		}
+	}
+
+	return {
+		updates,
+		nextSequence: startSequence + updates.length
+	};
+};
+
 // createOpenAITextStream takes a responseBody with a SSE response,
 // and returns an async generator that emits delta updates with large deltas chunked into random sized chunks
 export async function createOpenAITextStream(
@@ -170,11 +215,10 @@ async function* openAIStreamToIterator(
 
 			const delta = parsedData.choices?.[0]?.delta ?? {};
 			let image = consumeImageDelta(pendingImages, delta?.image);
-			if (!image) {
-				image = consumeImageUrlDelta(delta?.image_url, imageUrlSequence);
-				if (image) {
-					imageUrlSequence += 1;
-				}
+			const imageUrlUpdates = collectImageUrlDeltas(delta, imageUrlSequence);
+			imageUrlSequence = imageUrlUpdates.nextSequence;
+			if (!image && imageUrlUpdates.updates.length > 0) {
+				image = imageUrlUpdates.updates[0] ?? null;
 			}
 			const textValue = delta?.content ?? '';
 
@@ -191,6 +235,19 @@ async function* openAIStreamToIterator(
 					value: '',
 					image
 				};
+
+				const extraImageUpdates = delta?.image
+					? imageUrlUpdates.updates
+					: imageUrlUpdates.updates.slice(1);
+				if (extraImageUpdates.length > 0) {
+					for (const extraImage of extraImageUpdates) {
+						yield {
+							done: false,
+							value: '',
+							image: extraImage
+						};
+					}
+				}
 				continue;
 			}
 		} catch (e) {

@@ -2808,6 +2808,18 @@ async def generate_chat_completion(
                 _last_usage = None
                 _total_content_len = 0
                 _image_payload_count = 0
+                try:
+                    _chunk_max_buffer_size = int(
+                        getattr(
+                            request.app.state.config,
+                            "CHAT_STREAM_RESPONSE_CHUNK_MAX_BUFFER_SIZE",
+                            16777216,
+                        )
+                        or 16777216
+                    )
+                except Exception:
+                    _chunk_max_buffer_size = 16777216
+                _chunk_max_buffer_size = max(_chunk_max_buffer_size, 65536)
 
                 # Use iter_any() to avoid aiohttp's readline() buffer
                 # limit which crashes on large SSE lines (e.g. base64
@@ -2815,7 +2827,12 @@ async def generate_chat_completion(
                 # split on b'\n' ourselves, yielding complete lines to
                 # the downstream middleware.
                 _buf = b""
-                async for raw in _orig_content.iter_any():
+                _stream_iter = (
+                    _orig_content.iter_chunked(_chunk_max_buffer_size)
+                    if hasattr(_orig_content, "iter_chunked")
+                    else _orig_content.iter_any()
+                )
+                async for raw in _stream_iter:
                     _buf += raw
                     # Split on newline – may produce multiple lines per
                     # raw chunk, or none if the line is still incomplete.
@@ -2855,12 +2872,35 @@ async def generate_chat_completion(
                                             _image_url.get("url")
                                             or _image_url.get("image_url")
                                         )
+                                    _images = _delta.get("images")
+                                    if isinstance(_images, dict):
+                                        _images = [_images]
+                                    _has_image_list_payload = False
+                                    if isinstance(_images, list):
+                                        for _image_item in _images:
+                                            if isinstance(_image_item, str) and _image_item.strip():
+                                                _has_image_list_payload = True
+                                                break
+                                            if not isinstance(_image_item, dict):
+                                                continue
+                                            _candidate = _image_item.get("image_url")
+                                            if isinstance(_candidate, dict):
+                                                _candidate = (
+                                                    _candidate.get("url")
+                                                    or _candidate.get("image_url")
+                                                )
+                                            elif not isinstance(_candidate, str):
+                                                _candidate = _image_item.get("url")
+                                            if isinstance(_candidate, str) and _candidate.strip():
+                                                _has_image_list_payload = True
+                                                break
                                     if (
                                         _delta.get("image")
                                         or (
                                             isinstance(_image_url, str)
                                             and _image_url.strip()
                                         )
+                                        or _has_image_list_payload
                                     ):
                                         _image_payload_count += 1
                                 _u = _payload.get("usage")

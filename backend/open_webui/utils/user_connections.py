@@ -135,6 +135,11 @@ def maybe_migrate_user_connections(request, user: UserModel) -> UserModel:
                 "GEMINI_API_KEYS": deepcopy(getattr(cfg, "GEMINI_API_KEYS", []) or []),
                 "GEMINI_API_CONFIGS": deepcopy(getattr(cfg, "GEMINI_API_CONFIGS", {}) or {}),
             }
+            global_grok = {
+                "GROK_API_BASE_URLS": deepcopy(getattr(cfg, "GROK_API_BASE_URLS", []) or []),
+                "GROK_API_KEYS": deepcopy(getattr(cfg, "GROK_API_KEYS", []) or []),
+                "GROK_API_CONFIGS": deepcopy(getattr(cfg, "GROK_API_CONFIGS", {}) or {}),
+            }
             global_anthropic = {
                 "ANTHROPIC_API_BASE_URLS": deepcopy(getattr(cfg, "ANTHROPIC_API_BASE_URLS", []) or []),
                 "ANTHROPIC_API_KEYS": deepcopy(getattr(cfg, "ANTHROPIC_API_KEYS", []) or []),
@@ -156,6 +161,11 @@ def maybe_migrate_user_connections(request, user: UserModel) -> UserModel:
                 global_gemini, "GEMINI_API_BASE_URLS", "GEMINI_API_KEYS", "GEMINI_API_CONFIGS"
             ):
                 connections["gemini"] = global_gemini
+                changed = True
+            if "grok" not in connections and _has_provider_values(
+                global_grok, "GROK_API_BASE_URLS", "GROK_API_KEYS", "GROK_API_CONFIGS"
+            ):
+                connections["grok"] = global_grok
                 changed = True
             if "anthropic" not in connections and _has_provider_values(
                 global_anthropic, "ANTHROPIC_API_BASE_URLS", "ANTHROPIC_API_KEYS", "ANTHROPIC_API_CONFIGS"

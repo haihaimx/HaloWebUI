@@ -82,6 +82,7 @@ export const settingsRevision = writable(0);
 export const ollamaConfigCache = writable(null);
 export const openaiConfigCache = writable(null);
 export const geminiConfigCache = writable(null);
+export const grokConfigCache = writable(null);
 export const anthropicConfigCache = writable(null);
 export const connectionsConfigCache = writable(null);
 

@@ -344,6 +344,7 @@
 	let scrollObserver: IntersectionObserver;
 	let userHasScrolled = false;
 	let isAutoScrolling = false;
+	let isPreparingChatView = false;
 	let _scrollResetRafId: number | null = null;
 	let _overviewFocusRafId: number | null = null;
 	let overviewPinnedMessageId: string | null = null;
@@ -381,6 +382,7 @@
 	let imageGenerationOptions: {
 		image_size?: string | null;
 		aspect_ratio?: string | null;
+		resolution?: string | null;
 		n?: number | null;
 	} = {};
 	let webSearchMode: WebSearchMode = 'off';
@@ -1679,6 +1681,7 @@
 	$: if (chatIdProp) {
 		(async () => {
 			loading = true;
+			isPreparingChatView = true;
 			composerStateSyncReady = false;
 			resetReasoningSelectionTracking();
 			webSearchSelectionSyncReady = false;
@@ -1712,7 +1715,10 @@
 					} catch (e) {}
 				}
 
-				window.setTimeout(() => scrollToBottom(), 0);
+				scrollToBottom();
+				await nextAnimationFrame();
+				await nextAnimationFrame();
+				isPreparingChatView = false;
 				const chatInput = document.getElementById('chat-input');
 				chatInput?.focus();
 				composerStateSyncReady = true;
@@ -3173,6 +3179,11 @@
 	};
 
 	let _scrollRafId: number | null = null;
+	const nextAnimationFrame = () =>
+		new Promise<number>((resolve) => {
+			requestAnimationFrame(resolve);
+		});
+
 	const scrollToBottom = async (behavior: ScrollBehavior = 'auto') => {
 		if (_scrollRafId !== null) return;
 		resetAutoScrollLock();
@@ -4759,7 +4770,10 @@
 					{initNewChat}
 				/>
 
-				<div class="flex flex-col flex-auto z-10 w-full min-w-0 @container">
+				<div
+					class="flex flex-col flex-auto z-10 w-full min-w-0 @container"
+					class:invisible={isPreparingChatView}
+				>
 					{#if ($settings?.landingPageMode === 'chat' && !$selectedAssistantScene) || hasMessages}
 						<div
 							class=" pb-2.5 flex flex-col justify-between w-full flex-auto overflow-auto h-0 max-w-full z-10 scrollbar-hidden"

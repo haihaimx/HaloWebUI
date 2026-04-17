@@ -247,6 +247,14 @@
 		return nodes;
 	};
 
+	const clearContentIfNeeded = () => {
+		if (!editor || editor.isDestroyed || editor.isEmpty) {
+			return;
+		}
+
+		editor.commands.clearContent();
+	};
+
 	export const replaceCommandWithText = async (text) => {
 		if (!editor) {
 			return;
@@ -298,7 +306,7 @@
 		}
 
 		if (text === '') {
-			editor.commands.clearContent();
+			clearContentIfNeeded();
 		} else {
 			editor.commands.setContent(toMentionHtml(text.replaceAll('\n\n', '\n')));
 		}
@@ -382,7 +390,7 @@
 		}
 
 		if (value === '') {
-			editor.commands.clearContent();
+			clearContentIfNeeded();
 			selectTemplate();
 			return;
 		}
@@ -425,7 +433,8 @@
 			element,
 			extensions: [
 				StarterKit.configure({
-					code: false
+					code: false,
+					codeBlock: false
 				}),
 				Code.configure({
 					inputRules: false
@@ -482,10 +491,6 @@
 				}
 
 				value = raw ? htmlValue : mdValue;
-
-				if (editor.isActive('paragraph') && value === '') {
-					editor.commands.clearContent();
-				}
 			},
 			editorProps: {
 				attributes: { id },

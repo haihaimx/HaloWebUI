@@ -9,6 +9,7 @@
 	import { healthCheckOpenAIConnection, verifyOpenAIConnection } from '$lib/apis/openai';
 	import { healthCheckOllamaConnection, verifyOllamaConnection } from '$lib/apis/ollama';
 	import { healthCheckGeminiConnection, verifyGeminiConnection } from '$lib/apis/gemini';
+	import { healthCheckGrokConnection, verifyGrokConnection } from '$lib/apis/grok';
 	import { healthCheckAnthropicConnection, verifyAnthropicConnection } from '$lib/apis/anthropic';
 
 	import Modal from '$lib/components/common/Modal.svelte';
@@ -69,6 +70,7 @@
 
 	export let ollama = false;
 	export let gemini = false;
+	export let grok = false;
 	export let anthropic = false;
 	export let direct = false;
 
@@ -194,6 +196,10 @@
 		  }
 		| {
 				provider: 'gemini';
+				connection: { url: string; key: string; config?: object };
+		  }
+		| {
+				provider: 'grok';
 				connection: { url: string; key: string; config?: object };
 		  }
 		| {
@@ -333,6 +339,7 @@
 
 	const isLegacyForceModeUrl = (inputUrl: string) =>
 		!gemini &&
+		!grok &&
 		!anthropic &&
 		!ollama &&
 		(inputUrl || '').trim().replace(/\/+$/, '').endsWith(OPENAI_CHAT_COMPLETIONS_SUFFIX);
@@ -371,7 +378,7 @@
 		hostname === 'api.openai.com' || hostname.endsWith('.openai.com');
 
 	const getDefaultNativeFileInputsEnabled = () => {
-		if (ollama || direct || anthropic || gemini || azure || isForceMode) {
+		if (ollama || direct || anthropic || gemini || grok || azure || isForceMode) {
 			return false;
 		}
 
@@ -386,6 +393,8 @@
 	// 获取规范化后的 URL
 	$: normalizedUrl = gemini
 		? normalizeUrl(url, '/v1beta')
+		: grok
+			? normalizeUrl(url.replace(/#$/, ''), '/v1')
 		: ollama
 			? url.trim().endsWith('#')
 				? url.trim().slice(0, -1).replace(/\/+$/, '')
@@ -446,12 +455,14 @@
 	// 预览完整的 API 端点
 	$: previewEndpoint = (() => {
 		if (!url) return '';
-		if (isForceMode) {
+		if (isForceMode && !grok) {
 			// 强制模式下直接显示用户输入（去掉 #）
 			return url.trim().slice(0, -1).replace(/\/+$/, '');
 		}
 		if (gemini) {
 			return `${normalizedUrl}/models`;
+		} else if (grok) {
+			return normalizedUrl;
 		} else if (anthropic) {
 			return `${normalizedUrl}/messages`;
 		} else if (ollama) {
@@ -463,11 +474,11 @@
 		}
 	})();
 
-	$: isOfficialOpenAIConnection = !gemini && !anthropic && !ollama && !direct && !azure
+	$: isOfficialOpenAIConnection = !gemini && !grok && !anthropic && !ollama && !direct && !azure
 		? isOfficialOpenAIHostname(getHostname(url || 'https://api.openai.com/v1'))
 		: false;
 	$: showNativeFileInputsToggle =
-		!ollama && !direct && !gemini && !anthropic && !azure && !isForceMode && useResponsesApi;
+		!ollama && !direct && !gemini && !grok && !anthropic && !azure && !isForceMode && useResponsesApi;
 	$: if (show && !nativeFileInputsTouched) {
 		nativeFileInputsEnabled = getDefaultNativeFileInputsEnabled();
 	}
@@ -500,7 +511,7 @@
 		...(azure ? { azure: true } : {}),
 		...(apiVersion ? { api_version: apiVersion } : {}),
 		...(parsedHeaders ? { headers: parsedHeaders } : {}),
-		...(!ollama && !gemini && !anthropic && !isForceMode && useResponsesApi
+		...(!ollama && !gemini && !grok && !anthropic && !isForceMode && useResponsesApi
 			? {
 					use_responses_api: true,
 					responses_api_exclude_patterns: responsesApiExcludePatterns
@@ -508,7 +519,7 @@
 						.filter((p) => p.trim())
 				}
 			: {}),
-		...(!ollama && !direct && !gemini && !anthropic && !azure && !isForceMode && useResponsesApi
+		...(!ollama && !direct && !gemini && !grok && !anthropic && !azure && !isForceMode && useResponsesApi
 			? {
 					native_file_inputs_enabled: nativeFileInputsEnabled
 				}
@@ -563,6 +574,21 @@
 		};
 	};
 
+	const buildGrokHealthCheckPayload = () => {
+		const parsedGrokHeaders = parseHeadersInput();
+		if (headers && parsedGrokHeaders === null) return null;
+
+		return {
+			url: normalizedUrl,
+			key,
+			config: {
+				auth_type,
+				...(prefixId.trim() ? { prefix_id: prefixId.trim() } : {}),
+				...(parsedGrokHeaders ? { headers: parsedGrokHeaders } : {})
+			}
+		};
+	};
+
 	const buildAnthropicHealthCheckPayload = () => {
 		const parsedAnthropicHeaders = parseHeadersInput();
 		if (headers && parsedAnthropicHeaders === null) return null;
@@ -612,6 +638,11 @@
 		if (gemini) {
 			const connection = buildGeminiHealthCheckPayload();
 			return connection ? { provider: 'gemini', connection } : null;
+		}
+
+		if (grok) {
+			const connection = buildGrokHealthCheckPayload();
+			return connection ? { provider: 'grok', connection } : null;
 		}
 
 		if (anthropic) {
@@ -684,6 +715,11 @@
 				});
 			} else if (request.provider === 'gemini') {
 				result = await healthCheckGeminiConnection(localStorage.token, {
+					...request.connection,
+					model: modelId
+				});
+			} else if (request.provider === 'grok') {
+				result = await healthCheckGrokConnection(localStorage.token, {
 					...request.connection,
 					model: modelId
 				});
@@ -817,6 +853,7 @@
 			key,
 			ollama,
 			gemini,
+			grok,
 			anthropic,
 			auth_type,
 			prefixId,
@@ -879,6 +916,41 @@
 		}
 	};
 
+	const verifyGrokHandler = async () => {
+		const verifyUrl = normalizedUrl;
+
+		let _headers = null;
+
+		if (headers) {
+			try {
+				_headers = JSON.parse(headers);
+				if (typeof _headers !== 'object' || Array.isArray(_headers)) {
+					_headers = null;
+					throw new Error('Headers must be a valid JSON object');
+				}
+				headers = JSON.stringify(_headers, null, 2);
+			} catch (error) {
+				toast.error($i18n.t('Headers must be a valid JSON object'));
+				return;
+			}
+		}
+
+		const res = await verifyGrokConnection(localStorage.token, {
+			url: verifyUrl,
+			key,
+			config: {
+				auth_type,
+				...(_headers ? { headers: _headers } : {})
+			}
+		}).catch((error) => {
+			showConnectionErrorToast(error);
+		});
+
+		if (res) {
+			toast.success($i18n.t('Server connection verified'));
+		}
+	};
+
 	const verifyAnthropicHandler = async () => {
 		const verifyUrl = normalizedUrl;
 
@@ -925,6 +997,8 @@
 			verifyOllamaHandler();
 		} else if (gemini) {
 			verifyGeminiHandler();
+		} else if (grok) {
+			verifyGrokHandler();
 		} else if (anthropic) {
 			verifyAnthropicHandler();
 		} else {
@@ -1027,7 +1101,7 @@
 					connection_type: connectionType,
 					auth_type,
 					headers: headers ? JSON.parse(headers) : undefined,
-					...(isForceMode ? { force_mode: true } : {}),
+					...(!grok && isForceMode ? { force_mode: true } : {}),
 					...(anthropic
 						? {
 								anthropic_version: anthropicVersion,
@@ -1042,12 +1116,12 @@
 							}
 						: {}),
 					...(!ollama && azure ? { azure: true, ...(apiVersion ? { api_version: apiVersion } : {}) } : {}),
-					...(!ollama && !gemini && !anthropic && !direct && !azure && !isForceMode && useResponsesApi
+					...(!ollama && !gemini && !grok && !anthropic && !direct && !azure && !isForceMode && useResponsesApi
 						? {
 								native_file_inputs_enabled: nativeFileInputsEnabled
 							}
 						: {}),
-					...(!ollama && !gemini && !anthropic && !isForceMode && useResponsesApi
+					...(!ollama && !gemini && !grok && !anthropic && !isForceMode && useResponsesApi
 						? {
 								use_responses_api: true,
 								responses_api_exclude_patterns: responsesApiExcludePatterns
@@ -1123,7 +1197,8 @@
 
 		if (connection) {
 			const shouldRestoreForceMode =
-				connection.config?.force_mode === true || isLegacyForceModeUrl(connection.url);
+				(!grok && connection.config?.force_mode === true) ||
+				isLegacyForceModeUrl(connection.url);
 			url =
 				shouldRestoreForceMode && !connection.url.trim().endsWith('#')
 					? `${connection.url}#`
@@ -1265,6 +1340,7 @@
 	anthropic_beta={anthropicBetas.map((b) => b.name).filter((b) => b.trim())}
 	{ollama}
 	{gemini}
+	{grok}
 	{anthropic}
 />
 
@@ -1301,7 +1377,7 @@
 					<Switch bind:state={enable} />
 				</div>
 				<!-- Responses API 状态指示器 -->
-				{#if !ollama && !gemini && !anthropic && !direct && !azure && !isForceMode}
+				{#if !ollama && !gemini && !grok && !anthropic && !direct && !azure && !isForceMode}
 					<div
 						class="flex items-center gap-1.5 px-2.5 py-1 rounded-full {useResponsesApi
 							? 'bg-blue-50 dark:bg-blue-900/30'
@@ -1422,7 +1498,7 @@
 										bind:value={url}
 										on:blur={() => {
 											// Keep provider-specific URLs normalized unless user explicitly disables normalization via '#'.
-											if ((gemini || azure) && !isForceMode && url && url.trim() !== normalizedUrl) {
+											if ((gemini || grok || azure) && !isForceMode && url && url.trim() !== normalizedUrl) {
 												url = normalizedUrl;
 											}
 										}}
@@ -1462,6 +1538,8 @@
 										<span class="break-all"
 											>https://generativelanguage.googleapis.com/v1beta/models</span
 										>
+									{:else if grok}
+										<span class="break-all">https://api.x.ai/v1</span>
 									{:else if anthropic}
 										<span class="break-all">https://api.anthropic.com/v1/messages</span>
 									{:else if ollama}
@@ -1470,7 +1548,7 @@
 										<span class="break-all">https://api.openai.com/v1/chat/completions</span>
 									{/if}
 								</div>
-								{#if isForceMode && !gemini && !anthropic && !ollama}
+								{#if isForceMode && !gemini && !grok && !anthropic && !ollama}
 									<div class="text-xs text-amber-600 dark:text-amber-400 mt-1">
 										{$i18n.t(
 											'Force mode uses the exact URL and will not auto-append /chat/completions or /v1.'
@@ -1878,7 +1956,7 @@
 											</div>
 										</div>
 									</div>
-								{:else if !ollama && !direct && !anthropic}
+								{:else if !ollama && !direct && !anthropic && !grok}
 									<!-- Provider Type -->
 									<div class="flex items-center justify-between">
 										<span class="text-sm">{$i18n.t('Provider Type')}</span>
@@ -1937,7 +2015,7 @@
 									</div>
 								{/if}
 
-								{#if !ollama && !direct && !gemini && !anthropic && !azure && !isForceMode}
+								{#if !ollama && !direct && !gemini && !grok && !anthropic && !azure && !isForceMode}
 									<!-- Use Responses API -->
 									<div class="flex flex-col gap-2">
 										<div class="flex items-center justify-between">
@@ -2009,7 +2087,7 @@
 											{/if}
 										{/if}
 									</div>
-								{:else if isForceMode && !ollama && !direct && !gemini && !anthropic && !azure}
+								{:else if isForceMode && !ollama && !direct && !gemini && !grok && !anthropic && !azure}
 									<div class="text-xs text-amber-600 dark:text-amber-400">
 										{$i18n.t('Force mode connections do not support Responses API auto-routing.')}
 									</div>

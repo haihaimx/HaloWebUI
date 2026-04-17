@@ -69,6 +69,40 @@ def test_extract_stream_content_and_files_handles_top_level_image_url_without_te
     assert files == [{"type": "image", "url": "data:image/png;base64,abcd"}]
 
 
+def test_extract_stream_content_and_files_handles_top_level_images_array():
+    text, files = _extract_stream_content_and_files(
+        {
+            "role": "assistant",
+            "content": "caption",
+            "images": [
+                {"image_url": {"url": "data:image/png;base64,abcd"}},
+                {"image_url": "data:image/png;base64,efgh"},
+            ],
+        }
+    )
+
+    assert text == "caption"
+    assert files == [
+        {"type": "image", "url": "data:image/png;base64,abcd"},
+        {"type": "image", "url": "data:image/png;base64,efgh"},
+    ]
+
+
+def test_extract_stream_content_and_files_skips_base64_image_urls_when_disabled():
+    text, files = _extract_stream_content_and_files(
+        {
+            "role": "assistant",
+            "content": "caption",
+            "image_url": {"url": "data:image/png;base64,abcd"},
+            "images": [{"image_url": "data:image/png;base64,efgh"}],
+        },
+        allow_base64_image_url_conversion=False,
+    )
+
+    assert text == "caption"
+    assert files == []
+
+
 def test_consume_stream_image_delta_reassembles_final_image_file():
     pending_images = {}
 

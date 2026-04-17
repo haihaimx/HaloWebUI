@@ -123,6 +123,7 @@
 	export let imageGenerationOptions: {
 		image_size?: string | null;
 		aspect_ratio?: string | null;
+		resolution?: string | null;
 		n?: number | null;
 	} = {};
 	export let webSearchMode: WebSearchMode = 'off';

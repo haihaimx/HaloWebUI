@@ -336,13 +336,73 @@ def _extract_image_files_from_text(text: Any) -> tuple[str, list[dict]]:
     return cleaned.strip(), _merge_message_files(None, files)
 
 
-def _extract_stream_content_and_files(value: Any) -> tuple[str, list[dict]]:
+def _filter_response_image_files(
+    files: Any, *, allow_base64_image_url_conversion: bool = True
+) -> list[dict]:
+    normalized = _normalize_message_files(files)
+    if allow_base64_image_url_conversion:
+        return normalized
+
+    filtered: list[dict] = []
+    for file_item in normalized:
+        if not isinstance(file_item, dict):
+            continue
+
+        url = str(file_item.get("url") or "").strip()
+        if url.startswith("data:image/"):
+            continue
+        filtered.append(file_item)
+
+    return filtered
+
+
+def _extract_top_level_response_image_files(
+    value: Any, *, allow_base64_image_url_conversion: bool = True
+) -> list[dict]:
+    if not isinstance(value, dict):
+        return []
+
+    image_payloads: list[Any] = []
+
+    if "image_url" in value:
+        image_payloads.append({"type": "image_url", "image_url": value.get("image_url")})
+
+    raw_images = value.get("images")
+    if isinstance(raw_images, dict):
+        raw_images = [raw_images]
+    if isinstance(raw_images, list):
+        for image_item in raw_images:
+            if isinstance(image_item, dict):
+                image_type = str(image_item.get("type") or "").strip().lower()
+                if image_type in {"image", "image_url", "input_image", "output_image"}:
+                    image_payloads.append(image_item)
+                elif "image_url" in image_item:
+                    image_payloads.append(
+                        {"type": "image_url", "image_url": image_item.get("image_url")}
+                    )
+                elif image_item.get("url"):
+                    image_payloads.append({"type": "image", "url": image_item.get("url")})
+            elif isinstance(image_item, str):
+                image_payloads.append({"type": "image", "url": image_item})
+
+    return _filter_response_image_files(
+        image_payloads,
+        allow_base64_image_url_conversion=allow_base64_image_url_conversion,
+    )
+
+
+def _extract_stream_content_and_files(
+    value: Any, *, allow_base64_image_url_conversion: bool = True
+) -> tuple[str, list[dict]]:
     if isinstance(value, list):
         parts: list[str] = []
         files: list[dict] = []
 
         for item in value:
-            text_part, file_part = _extract_stream_content_and_files(item)
+            text_part, file_part = _extract_stream_content_and_files(
+                item,
+                allow_base64_image_url_conversion=allow_base64_image_url_conversion,
+            )
             if text_part:
                 parts.append(text_part)
             if file_part:
@@ -353,19 +413,23 @@ def _extract_stream_content_and_files(value: Any) -> tuple[str, list[dict]]:
     if isinstance(value, dict):
         item_type = str(value.get("type") or "").strip().lower()
         if item_type in {"image", "image_url", "input_image", "output_image"}:
-            files = _normalize_message_files(value)
+            files = _filter_response_image_files(
+                value,
+                allow_base64_image_url_conversion=allow_base64_image_url_conversion,
+            )
             return "", files
 
-        top_level_files: list[dict] = []
-        if "image_url" in value:
-            top_level_files = _merge_message_files(
-                top_level_files,
-                [{"type": "image_url", "image_url": value.get("image_url")}],
-            )
+        top_level_files = _extract_top_level_response_image_files(
+            value,
+            allow_base64_image_url_conversion=allow_base64_image_url_conversion,
+        )
 
         nested_content = value.get("content")
         if isinstance(nested_content, (list, dict)):
-            text_part, nested_files = _extract_stream_content_and_files(nested_content)
+            text_part, nested_files = _extract_stream_content_and_files(
+                nested_content,
+                allow_base64_image_url_conversion=allow_base64_image_url_conversion,
+            )
             return text_part, _merge_message_files(top_level_files, nested_files)
 
         text_value = (
@@ -374,7 +438,10 @@ def _extract_stream_content_and_files(value: Any) -> tuple[str, list[dict]]:
             or value.get("value")
             or ""
         )
-        text_part, nested_files = _extract_stream_content_and_files(text_value)
+        text_part, nested_files = _extract_stream_content_and_files(
+            text_value,
+            allow_base64_image_url_conversion=allow_base64_image_url_conversion,
+        )
         return text_part, _merge_message_files(top_level_files, nested_files)
 
     if isinstance(value, str):
@@ -3647,6 +3714,13 @@ async def process_chat_response(
     # Non-streaming response
     if not isinstance(response, StreamingResponse):
         if event_emitter:
+            allow_base64_image_url_conversion = bool(
+                getattr(
+                    request.app.state.config,
+                    "ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION",
+                    False,
+                )
+            )
             if "error" in response:
                 error = response["error"].get("detail", response["error"])
                 Chats.upsert_message_to_chat_by_id_and_message_id(
@@ -3660,7 +3734,10 @@ async def process_chat_response(
             choices = response.get("choices", [])
             if choices and isinstance(choices[0], dict):
                 message_payload = choices[0].get("message", {}) or {}
-                content, message_files = _extract_stream_content_and_files(message_payload)
+                content, message_files = _extract_stream_content_and_files(
+                    message_payload,
+                    allow_base64_image_url_conversion=allow_base64_image_url_conversion,
+                )
                 response_message = response["choices"][0].setdefault("message", {})
 
                 if message_files:
@@ -4391,6 +4468,14 @@ async def process_chat_response(
                             }
                         )
 
+                    allow_base64_image_url_conversion = bool(
+                        getattr(
+                            request.app.state.config,
+                            "ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION",
+                            False,
+                        )
+                    )
+
                     _stream_line_count = 0
                     _stream_data_count = 0
                     _stream_skip_count = 0
@@ -4732,7 +4817,8 @@ async def process_chat_response(
                                             tool_call_lookup[key] = resolved_idx
 
                                 value, streamed_files = _extract_stream_content_and_files(
-                                    delta
+                                    delta,
+                                    allow_base64_image_url_conversion=allow_base64_image_url_conversion,
                                 )
                                 streamed_image = _consume_stream_image_delta(
                                     pending_stream_images,

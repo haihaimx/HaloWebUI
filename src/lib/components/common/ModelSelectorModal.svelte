@@ -10,6 +10,7 @@
 	import { verifyOpenAIConnection } from '$lib/apis/openai';
 	import { verifyOllamaConnection } from '$lib/apis/ollama';
 	import { verifyGeminiConnection } from '$lib/apis/gemini';
+	import { verifyGrokConnection } from '$lib/apis/grok';
 	import { verifyAnthropicConnection } from '$lib/apis/anthropic';
 	import {
 		inferModelCapabilities,
@@ -44,6 +45,7 @@
 	export let api_version: string | undefined = undefined;
 	export let ollama = false;
 	export let gemini = false;
+	export let grok = false;
 	export let anthropic = false;
 	export let auth_type: string | undefined = undefined;
 	export let headers: Record<string, string> | undefined = undefined;
@@ -157,6 +159,24 @@
 						native_web_search_supported: m.native_web_search_supported,
 						native_web_search_support: m.native_web_search_support
 					}));
+			} else if (grok) {
+				data = await verifyGrokConnection(localStorage.token, {
+					url,
+					key,
+					config: {
+						...(auth_type ? { auth_type } : {}),
+						...(headers ? { headers } : {})
+					}
+				});
+
+				if (!Array.isArray(data?.models)) {
+					throw new Error('Grok: Invalid response (expected models.list format)');
+				}
+
+				availableModels = (data.models || []).map((m: any) => ({
+					id: m.id,
+					name: m.name || m.id
+				}));
 			} else if (anthropic) {
 				data = await verifyAnthropicConnection(localStorage.token, {
 					url,
