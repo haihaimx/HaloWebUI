@@ -28,10 +28,11 @@ jobs:
           BUILD_TIME=$(date -u +'%Y%m%d-%H%M%S')
           FULL_IMAGE="${REGISTRY}/openwebui/${IMAGE_NAME}"
           TAG="${FULL_IMAGE}:${BUILD_TIME}"
+          LATEST="${FULL_IMAGE}:latest"
 
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "latest=${LATEST}" >> "$GITHUB_OUTPUT"
           echo "build_time=${BUILD_TIME}" >> "$GITHUB_OUTPUT"
-
           echo "镜像: ${TAG}"
 
       - name: 设置 QEMU
@@ -64,7 +65,9 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.meta.outputs.tag }}
+          tags: |
+            ${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.latest }}
           build-args: |
             INSTALL_PROFILE=core
             PRELOAD_LOCAL_MODELS=false
