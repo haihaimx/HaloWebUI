@@ -35,6 +35,9 @@
 						)
 					: getErrorDetail(error, $i18n.t('Failed to update settings'))
 			);
+			if (error && typeof error === 'object') {
+				(error as { __toastShown?: boolean }).__toastShown = true;
+			}
 			throw error;
 		}
 	};
@@ -130,7 +133,10 @@
 			</div>
 		</nav>
 
-		<div class="pb-1 px-[18px] flex-1 max-h-full overflow-y-auto" id="settings-container">
+		<div
+			class="pb-1 px-[18px] flex-1 max-h-full overflow-y-auto"
+			id="settings-container"
+		>
 			<div class="flex flex-col lg:flex-row w-full h-full min-h-0 pb-2 lg:space-x-4">
 				<div
 					id="settings-tabs-container"

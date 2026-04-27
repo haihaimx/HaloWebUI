@@ -481,6 +481,7 @@ from open_webui.utils.models import (
     get_all_base_models,
     check_model_access,
 )
+from open_webui.utils.model_identity import resolve_model_from_lookup
 from open_webui.utils.chat import (
     generate_chat_completion as chat_completion_handler,
     chat_completed as chat_completed_handler,
@@ -525,6 +526,18 @@ log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 class SPAStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):
+        response = await self._get_response(path, scope)
+
+        if path.startswith("_app/immutable/"):
+            response.headers.setdefault(
+                "Cache-Control", "public, max-age=31536000, immutable"
+            )
+        elif path.startswith(("assets/", "wasm/")):
+            response.headers.setdefault("Cache-Control", "public, max-age=86400")
+
+        return response
+
+    async def _get_response(self, path: str, scope):
         try:
             return await super().get_response(path, scope)
         except (HTTPException, StarletteHTTPException) as ex:
@@ -536,6 +549,17 @@ class SPAStaticFiles(StaticFiles):
                     return await super().get_response("index.html", scope)
             else:
                 raise ex
+
+
+class StaticFilesWithCache(StaticFiles):
+    async def get_response(self, path: str, scope):
+        try:
+            response = await super().get_response(path, scope)
+        except (HTTPException, StarletteHTTPException):
+            raise
+
+        response.headers.setdefault("Cache-Control", "public, max-age=86400")
+        return response
 
 
 print(
@@ -1408,9 +1432,23 @@ async def get_models(request: Request, user=Depends(get_verified_user)):
     model_order_list = request.app.state.config.MODEL_ORDER_LIST
     if model_order_list:
         model_order_dict = {model_id: i for i, model_id in enumerate(model_order_list)}
+
+        def get_model_order_index(model):
+            aliases = [
+                model.get("selection_id"),
+                model.get("id"),
+                model.get("model_id"),
+                model.get("original_id"),
+                *(model.get("legacy_ids") or []),
+            ]
+            return min(
+                (model_order_dict[alias] for alias in aliases if alias in model_order_dict),
+                default=float("inf"),
+            )
+
         # Sort models by order list priority, with fallback for those not in the list
         models.sort(
-            key=lambda x: (model_order_dict.get(x["id"], float("inf")), x["name"])
+            key=lambda x: (get_model_order_index(x), x["name"])
         )
 
     # Filter out workspace/shared models that the user does not have access to.
@@ -1432,6 +1470,45 @@ async def get_models(request: Request, user=Depends(get_verified_user)):
         f"/api/models returned filtered models accessible to the user: {json.dumps([model['id'] for model in models])}"
     )
     return {"data": models}
+
+
+def _apply_connection_owner_for_model(request: Request, user, model: dict | None):
+    if not isinstance(model, dict):
+        return
+
+    try:
+        model_info = Models.get_model_by_id(model.get("id"))
+        if model_info and model_info.user_id and model_info.user_id != user.id:
+            from open_webui.models.users import Users  # local import to avoid heavy coupling
+            from open_webui.utils.user_connections import maybe_migrate_user_connections
+
+            owner = Users.get_user_by_id(model_info.user_id)
+            if owner:
+                owner = maybe_migrate_user_connections(request, owner)
+                request.state.connection_user = owner
+    except Exception:
+        pass
+
+
+def _get_http_error_message(exc: Exception) -> str:
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        if isinstance(detail, dict):
+            message = detail.get("message") or detail.get("detail") or detail.get("code")
+            if message:
+                return str(message)
+        if detail is not None:
+            return str(detail)
+    return str(exc)
+
+
+def _raise_preserving_http_exception(exc: Exception, default_status: int) -> None:
+    if isinstance(exc, HTTPException):
+        raise exc
+    raise HTTPException(
+        status_code=default_status,
+        detail=str(exc),
+    )
 
 
 @app.get("/api/models/base")
@@ -1457,26 +1534,23 @@ async def chat_completion(
             # Build a user-scoped model map for this request.
             await get_all_models(request, user=user)
             models_map = getattr(request.state, "MODELS", {}) or {}
+            ambiguous_model_aliases = getattr(request.state, "MODELS_AMBIGUOUS", set()) or set()
 
             model_id = form_data.get("model", None)
-            if model_id not in models_map:
+            model = resolve_model_from_lookup(
+                models_map,
+                ambiguous_model_aliases,
+                model_id,
+            )
+            if not model:
                 raise Exception("Model not found")
 
-            model = models_map[model_id]
-            model_info = Models.get_model_by_id(model_id)
+            model_info = Models.get_model_by_id(model.get("id"))
+            request.state.model = model
 
             # Shared model: route provider requests through the owning user's connections
             # (admin shares models by marking them public/private in the Models table).
-            if model_info and model_info.user_id and model_info.user_id != user.id:
-                try:
-                    from open_webui.models.users import Users  # local import to avoid heavy coupling
-
-                    owner = Users.get_user_by_id(model_info.user_id)
-                    if owner:
-                        request.state.connection_user = owner
-                except Exception:
-                    # Best effort; provider routers will fall back to the request user.
-                    pass
+            _apply_connection_owner_for_model(request, user, model)
 
             # Check if user has access to the model
             if not BYPASS_MODEL_ACCESS_CONTROL and user.role == "user":
@@ -1568,16 +1642,25 @@ async def chat_completion(
                 metadata["chat_id"],
                 metadata["message_id"],
                 {
-                    "error": {"content": str(e)},
+                    "error": {"content": _get_http_error_message(e)},
                 },
             )
 
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
+        _raise_preserving_http_exception(e, status.HTTP_400_BAD_REQUEST)
 
     try:
+        if metadata.get("local_response") is not None:
+            return await process_chat_response(
+                request,
+                metadata["local_response"],
+                form_data,
+                user,
+                metadata,
+                model,
+                events,
+                tasks,
+            )
+
         _emitter = get_event_emitter(metadata)
         if _emitter:
             await _emitter(
@@ -1689,10 +1772,7 @@ async def chat_completion(
             except Exception:
                 pass
 
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
+        _raise_preserving_http_exception(e, status.HTTP_400_BAD_REQUEST)
 
 
 # Alias for chat_completion (Legacy)
@@ -1751,24 +1831,17 @@ async def chat_completed(
             request.state.model = model_item
         else:
             await get_all_models(request, user=user)
-            try:
-                model_id = form_data.get("model")
-                model_info = Models.get_model_by_id(model_id) if model_id else None
-                if model_info and model_info.user_id and model_info.user_id != user.id:
-                    from open_webui.models.users import Users
-
-                    owner = Users.get_user_by_id(model_info.user_id)
-                    if owner:
-                        request.state.connection_user = owner
-            except Exception:
-                pass
+            model_id = form_data.get("model")
+            model = resolve_model_from_lookup(
+                getattr(request.state, "MODELS", {}) or {},
+                getattr(request.state, "MODELS_AMBIGUOUS", set()) or set(),
+                model_id,
+            )
+            _apply_connection_owner_for_model(request, user, model)
 
         return await chat_completed_handler(request, form_data, user)
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
+        _raise_preserving_http_exception(e, status.HTTP_400_BAD_REQUEST)
 
 
 @app.post("/api/chat/actions/{action_id}")
@@ -1783,24 +1856,17 @@ async def chat_action(
             request.state.model = model_item
         else:
             await get_all_models(request, user=user)
-            try:
-                model_id = form_data.get("model")
-                model_info = Models.get_model_by_id(model_id) if model_id else None
-                if model_info and model_info.user_id and model_info.user_id != user.id:
-                    from open_webui.models.users import Users
-
-                    owner = Users.get_user_by_id(model_info.user_id)
-                    if owner:
-                        request.state.connection_user = owner
-            except Exception:
-                pass
+            model_id = form_data.get("model")
+            model = resolve_model_from_lookup(
+                getattr(request.state, "MODELS", {}) or {},
+                getattr(request.state, "MODELS_AMBIGUOUS", set()) or set(),
+                model_id,
+            )
+            _apply_connection_owner_for_model(request, user, model)
 
         return await chat_action_handler(request, action_id, form_data, user)
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
+        _raise_preserving_http_exception(e, status.HTTP_400_BAD_REQUEST)
 
 
 @app.post("/api/tasks/stop/{task_id}")
@@ -2143,7 +2209,7 @@ async def healthcheck_with_db():
     return {"status": True}
 
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/static", StaticFilesWithCache(directory=STATIC_DIR), name="static")
 app.mount("/cache", StaticFiles(directory=CACHE_DIR), name="cache")
 
 

@@ -9,6 +9,8 @@
 	import { synthesizeOpenAISpeech, transcribeAudio } from '$lib/apis/audio';
 	import { uploadFile } from '$lib/apis/files';
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
+	import { isDedicatedImageGenerationModel } from '$lib/utils/model-capabilities';
+	import { findModelByIdentity } from '$lib/utils/model-identity';
 
 	import { toast } from 'svelte-sonner';
 
@@ -24,6 +26,7 @@
 	export let files;
 	export let chatId;
 	export let modelId;
+	export let imageGenerationEnabled = false;
 
 	let wakeLock = null;
 
@@ -475,7 +478,11 @@
 			try {
 				// Set the emoji for the content if needed
 				if ($settings?.showEmojiInCall ?? false) {
-					const emoji = await generateEmoji(localStorage.token, modelId, content, chatId);
+					const emoji = await generateEmoji(localStorage.token, modelId, content, chatId, {
+						skipTextEnhancements:
+							imageGenerationEnabled ||
+							(model?.id ? isDedicatedImageGenerationModel(model.id) : false)
+					});
 					if (emoji) {
 						emojiCache.set(content, emoji);
 					}
@@ -660,7 +667,7 @@
 			});
 		}
 
-		model = $models.find((m) => m.id === modelId);
+		model = findModelByIdentity($models, modelId);
 
 		startRecording();
 

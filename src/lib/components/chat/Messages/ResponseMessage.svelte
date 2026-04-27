@@ -84,6 +84,7 @@
 	import { KokoroWorker } from '$lib/workers/KokoroWorker';
 	import FileItem from '$lib/components/common/FileItem.svelte';
 	import { getModelChatDisplayName } from '$lib/utils/model-display';
+	import { findModelByIdentity } from '$lib/utils/model-identity';
 	import {
 		getRenderableMessageError,
 		hasVisibleMessageFiles as messageHasVisibleFiles
@@ -212,6 +213,7 @@
 
 	export let isLastMessage = true;
 	export let readOnly = false;
+	export let forceExpandContent = false;
 
 	let buttonsContainerElement: HTMLDivElement;
 	let citationsRef: any = null;
@@ -313,7 +315,7 @@
 	// };
 
 	let model = null;
-	$: model = $models.find((m) => m.id === message.model);
+	$: model = findModelByIdentity($models, message.model);
 	$: stats = getStatsDisplay(message);
 
 	const doRegenerate = () => {
@@ -693,10 +695,34 @@
 		await tick();
 	};
 
+	const formatImageGenerationError = (error: unknown) => {
+		if (typeof error === 'string' && error.trim()) {
+			return error;
+		}
+
+		if (error && typeof error === 'object') {
+			if ('detail' in error) {
+				const detail = error.detail;
+				if (typeof detail === 'string' && detail.trim()) {
+					return detail;
+				}
+				if (detail && typeof detail === 'object' && 'message' in detail && typeof detail.message === 'string') {
+					return detail.message;
+				}
+			}
+
+			if ('message' in error && typeof error.message === 'string' && error.message.trim()) {
+				return error.message;
+			}
+		}
+
+		return `${error}`;
+	};
+
 	const generateImage = async (message: MessageType) => {
 		generatingImage = true;
 		const res = await imageGenerations(localStorage.token, message.content).catch((error) => {
-			toast.error(`${error}`);
+			toast.error(formatImageGenerationError(error));
 		});
 		console.log(res);
 
@@ -864,7 +890,9 @@
 
 <DeleteConfirmDialog
 	bind:show={showRegenerateConfirm}
-	title={$i18n.t('Regenerate with {{modelName}}?', { modelName: model?.name ?? message.model })}
+	title={$i18n.t('Regenerate with {{modelName}}?', {
+		modelName: getModelChatDisplayName(model) || message.modelName || message.model
+	})}
 	on:confirm={() => {
 		doRegenerate();
 	}}
@@ -897,9 +925,9 @@
 
 		<div class="flex-auto w-0 sm:pl-1 relative z-10">
 			<Name>
-				<Tooltip content={getModelChatDisplayName(model) || message.model} placement="top-start">
+				<Tooltip content={getModelChatDisplayName(model) || message.modelName || message.model} placement="top-start">
 					<span class="line-clamp-1 text-black dark:text-white font-semibold">
-						{getModelChatDisplayName(model) || message.model}
+						{getModelChatDisplayName(model) || message.modelName || message.model}
 					</span>
 				</Tooltip>
 
@@ -1058,11 +1086,16 @@
 						{/if}
 
 						{#if message?.files && message.files?.filter((f) => f.type === 'image').length > 0}
-							<div class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap">
+							<div class="my-1 flex overflow-x-auto gap-2 flex-wrap">
 								{#each message.files as file}
 									<div>
 										{#if file.type === 'image'}
-											<Image src={file.url} alt={message.content} />
+											<Image
+												src={file.url}
+												alt={message.content}
+												className="outline-hidden focus:outline-hidden"
+												imageClassName="rounded-lg chat-message-image"
+											/>
 										{:else}
 											<FileItem
 												item={file}
@@ -1197,6 +1230,7 @@
 												content={message.content}
 												streaming={!message.done}
 												{isLastMessage}
+												forceExpand={forceExpandContent}
 												sources={message.sources}
 												floatingButtons={message?.done &&
 													!readOnly &&

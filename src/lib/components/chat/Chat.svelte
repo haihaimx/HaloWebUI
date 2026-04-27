@@ -64,6 +64,19 @@
 	} from '$lib/utils/selection-threads';
 	import { getModelChatDisplayName } from '$lib/utils/model-display';
 	import {
+		buildModelIdentityLookup,
+		getModelCleanId,
+		getModelRef,
+		getModelSelectionId,
+		resolveModelSelectionId
+	} from '$lib/utils/model-identity';
+	import {
+		buildModelSelectionHint,
+		resolveChatModelSelection,
+		resolveChatModelSelections,
+		type ChatModelResolution
+	} from '$lib/utils/chat-model-recovery';
+	import {
 		type ChatAssistantSnapshot,
 		PENDING_ASSISTANT_STORAGE_KEY,
 		toChatAssistantSnapshot
@@ -82,6 +95,7 @@
 		type WebSearchModeSource
 	} from '$lib/utils/web-search-mode';
 	import { getFunctionPipeRootId } from '$lib/utils/image-generation';
+	import { isDedicatedImageGenerationModel } from '$lib/utils/model-capabilities';
 	import { applyUserSettingsSnapshot } from '$lib/utils/user-settings';
 	import { buildWebSearchModeOptions } from '$lib/utils/native-web-search';
 
@@ -373,7 +387,8 @@
 	let selectedModels = [''];
 	let atSelectedModel: Model | undefined;
 	let selectedModelIds = [];
-	$: selectedModelIds = atSelectedModel !== undefined ? [atSelectedModel.id] : selectedModels;
+	$: selectedModelIds =
+		atSelectedModel !== undefined ? [getModelSelectionId(atSelectedModel)] : selectedModels;
 	let activeAssistant: ChatAssistantSnapshot | null = null;
 
 	let selectedToolIds = [];
@@ -381,12 +396,20 @@
 	let selectedSkillIds = [];
 	let skillSelectionTouched = false;
 	let imageGenerationEnabled = false;
-	let imageGenerationOptions: {
+	type ImageGenerationOptions = {
+		model?: string | null;
+		model_ref?: Record<string, unknown> | null;
 		image_size?: string | null;
 		aspect_ratio?: string | null;
 		resolution?: string | null;
 		n?: number | null;
-	} = {};
+		negative_prompt?: string | null;
+		credential_source?: string | null;
+		connection_index?: number | null;
+		steps?: number | null;
+		background?: string | null;
+	};
+	let imageGenerationOptions: ImageGenerationOptions = {};
 	let webSearchMode: WebSearchMode = 'off';
 	let webSearchModeSource: WebSearchModeSource = 'default';
 	let codeInterpreterEnabled = false;
@@ -413,13 +436,206 @@
 	// J-3-01: O(1) model lookup map — rebuilt reactively when $models changes
 	let modelsMap: Map<string, Model> = new Map();
 	$: {
-		const m = new Map<string, Model>();
-		for (const model of $models) {
-			m.set(model.id, model);
-		}
-		modelsMap = m;
+		const lookup = buildModelIdentityLookup($models);
+		modelsMap = lookup.byId;
 	}
 	const getModelById = (id: string): Model | undefined => modelsMap.get(id);
+	const getCanonicalModelId = (id: string): string =>
+		resolveModelSelectionId($models, id, { preserveAmbiguous: true });
+	const getModelRequestId = (model: Model): string => getModelSelectionId(model) || model.id;
+	const MODEL_CONNECTION_AMBIGUOUS_CODE = 'model_connection_ambiguous';
+	const MODEL_CONNECTION_STALE_CODE = 'model_connection_stale';
+	const getModelResolutionDetail = (error: unknown) => {
+		if (!error || typeof error !== 'object') return null;
+
+		const detail =
+			'detail' in error && error.detail && typeof error.detail === 'object' ? error.detail : error;
+		if (!detail || typeof detail !== 'object') return null;
+		const payload = detail as Record<string, unknown>;
+
+		const code = typeof payload.code === 'string' ? payload.code : '';
+		if (code !== MODEL_CONNECTION_AMBIGUOUS_CODE && code !== MODEL_CONNECTION_STALE_CODE) {
+			return null;
+		}
+
+		return {
+			code,
+			message: typeof payload.message === 'string' ? payload.message : '',
+			requestedModelId:
+				typeof payload.requested_model_id === 'string' ? payload.requested_model_id : '',
+			candidates: Array.isArray(payload.candidates)
+				? payload.candidates.map((candidate) => `${candidate ?? ''}`.trim()).filter(Boolean)
+				: []
+		};
+	};
+	const openModelSelector = async (index = 0, searchValue = '') => {
+		const button = document.getElementById(`model-selector-${index}-button`) as HTMLButtonElement | null;
+		if (!button) return;
+		button.click();
+		await tick();
+		const input = document.getElementById('model-search-input') as HTMLInputElement | null;
+		if (!input) return;
+		input.focus();
+		if (searchValue) {
+			input.value = searchValue;
+			input.dispatchEvent(new Event('input'));
+		}
+	};
+	const promptModelReselection = async ({
+		index = 0,
+		rawModelId = '',
+		ambiguous = false
+	}: {
+		index?: number;
+		rawModelId?: string;
+		ambiguous?: boolean;
+	}) => {
+		const selectorIndex = Math.max(0, index);
+		if (selectorIndex >= 0) {
+			const nextSelectedModels = [...selectedModels];
+			while (nextSelectedModels.length <= selectorIndex) {
+				nextSelectedModels.push('');
+			}
+			nextSelectedModels[selectorIndex] = '';
+			selectedModels = nextSelectedModels;
+		}
+
+		if (ambiguous) {
+			toast.error(
+				$i18n.t(
+					'This chat was saved in an older version with only the model name. Multiple connections now share that model. Please reselect the correct model with its connection suffix.'
+				)
+			);
+		} else {
+			toast.error(
+				$i18n.t(
+					'The saved model connection is no longer available. Please reselect the correct model with its connection suffix.'
+				)
+			);
+		}
+
+		await openModelSelector(selectorIndex, rawModelId);
+	};
+	const isBlockingModelResolution = (resolution: ChatModelResolution | null | undefined) =>
+		resolution?.status === 'stale' || resolution?.status === 'ambiguous';
+	const promptModelResolution = async (
+		resolution: ChatModelResolution,
+		index = 0
+	) => {
+		await promptModelReselection({
+			index,
+			rawModelId: resolution.searchValue || resolution.value,
+			ambiguous: resolution.status === 'ambiguous'
+		});
+	};
+	const resolveSelectedModel = (modelId: unknown, index = 0) =>
+		resolveChatModelSelection($models, {
+			value: modelId,
+			...(buildPersistedModelSelectionHints(selectedModels)[index] ?? {})
+		});
+	const findBlockingSelectedModelResolution = () => {
+		for (const [index, modelId] of selectedModels.entries()) {
+			const resolution = resolveSelectedModel(modelId, index);
+			if (isBlockingModelResolution(resolution)) {
+				return { index, resolution };
+			}
+		}
+		return null;
+	};
+	const resolveMessageModel = (message: any) =>
+		resolveChatModelSelection($models, {
+			value: message?.model,
+			model_ref: message?.model_ref,
+			display_name: message?.modelName
+		});
+	const applyResolvedMessageModel = (message: any, resolution: ChatModelResolution) => {
+		if (!message || resolution.status !== 'resolved' || !resolution.model) {
+			return;
+		}
+
+		message.model = resolution.value;
+		message.modelName = getModelChatDisplayName(resolution.model) || resolution.model.id || resolution.value;
+		const modelRef = getModelRef(resolution.model);
+		if (modelRef) {
+			message.model_ref = modelRef;
+		}
+	};
+	const getChatModelSelectionHints = (chatContent: any) =>
+		Array.isArray(chatContent?.model_selection_hints)
+			? chatContent.model_selection_hints
+			: [];
+	const buildPersistedModelSelectionHints = (modelIds: string[] = selectedModels) =>
+		modelIds.map((modelId) => {
+			const model = getModelById(modelId);
+			return (
+				buildModelSelectionHint(model) ?? {
+					selection_id: `${modelId ?? ''}`.trim(),
+					model_id: `${modelId ?? ''}`.trim()
+				}
+			);
+		});
+	const recoverLoadedChatModelState = (
+		chatContent: any,
+		loadedHistory: any,
+		loadedModels: unknown
+	) => {
+		const rawModels = Array.isArray(loadedModels) ? loadedModels : [loadedModels ?? ''];
+		const hints = getChatModelSelectionHints(chatContent);
+		const selectedResolutions = resolveChatModelSelections($models, rawModels, hints);
+		const latestResolvedByIndex = new Map<number, { resolution: ChatModelResolution; timestamp: number }>();
+
+		for (const message of Object.values(loadedHistory?.messages ?? {}) as any[]) {
+			if (!message || typeof message !== 'object') continue;
+
+			if (Array.isArray(message.models)) {
+				message.models = message.models.map((modelId: unknown, index: number) => {
+					const resolution = resolveChatModelSelection($models, { value: modelId });
+					return resolution.status === 'resolved' ? resolution.value : modelId;
+				});
+			}
+
+			if (message.role !== 'assistant') continue;
+
+			const resolution = resolveMessageModel(message);
+			if (resolution.status === 'resolved') {
+				applyResolvedMessageModel(message, resolution);
+				const modelIdx =
+					typeof message.modelIdx === 'number'
+						? message.modelIdx
+						: Number.isInteger(Number(message.modelIdx))
+							? Number(message.modelIdx)
+							: 0;
+				const timestamp = Number(message.timestamp ?? 0);
+				const previous = latestResolvedByIndex.get(modelIdx);
+				if (!previous || timestamp >= previous.timestamp) {
+					latestResolvedByIndex.set(modelIdx, { resolution, timestamp });
+				}
+			}
+		}
+
+		const nextSelectedModels = selectedResolutions.map((resolution, index) => {
+			if (resolution.status === 'resolved') return resolution.value;
+			const inferred = latestResolvedByIndex.get(index)?.resolution;
+			if (inferred?.status === 'resolved') return inferred.value;
+			return resolution.value;
+		});
+		for (const [index, item] of latestResolvedByIndex.entries()) {
+			if (index >= nextSelectedModels.length && item.resolution.status === 'resolved') {
+				while (nextSelectedModels.length < index) {
+					nextSelectedModels.push('');
+				}
+				nextSelectedModels[index] = item.resolution.value;
+			}
+		}
+
+		if (nextSelectedModels.length === 0 && latestResolvedByIndex.size > 0) {
+			return Array.from(latestResolvedByIndex.entries())
+				.sort(([left], [right]) => left - right)
+				.map(([, item]) => item.resolution.value);
+		}
+
+		return nextSelectedModels.length > 0 ? nextSelectedModels : [''];
+	};
 	const getVisibleSkillIds = () =>
 		($skillsStore ?? []).map((skill) => String(skill?.id ?? '')).filter((id) => id);
 	const filterVisibleSkillIds = (ids: string[] = []) => {
@@ -495,6 +711,22 @@
 
 		return getModelById(ids[0]) ?? null;
 	};
+
+	const getSingleSelectedDedicatedImageModel = (): Model | null => {
+		const model = getSingleSelectedReasoningModel();
+		if (!model) {
+			return null;
+		}
+
+		return isDedicatedImageGenerationModel(getModelCleanId(model) || model.id) ? model : null;
+	};
+
+	const canUseChatImageGeneration = () =>
+		Boolean($config?.features?.enable_image_generation) &&
+		($user?.role === 'admin' || $user?.permissions?.features?.image_generation);
+
+	const isImageGenerationActiveForRequest = () =>
+		imageGenerationEnabled || Boolean(getSingleSelectedDedicatedImageModel());
 
 	const getModelDefaultReasoningEffort = (model: Model | null | undefined): string | null =>
 		normalizeReasoningEffortValue((model as any)?.info?.params?.reasoning_effort ?? null);
@@ -831,10 +1063,13 @@
 			? normalizeWebSearchMode(webSearchMode, 'off')
 			: 'off';
 		const requestFiles = collectFloatingRequestFiles(messages);
+		const imageGenerationActive = canUseChatImageGeneration()
+			? isImageGenerationActiveForRequest()
+			: false;
 
 		return {
 			stream,
-			model: model.id,
+			model: getModelRequestId(model),
 			messages: requestMessages,
 			params: {
 				...$settings?.params,
@@ -854,17 +1089,10 @@
 			tool_servers: $toolServers,
 			features: {
 				memory: $settings?.memory ?? false,
-				image_generation:
-					$config?.features?.enable_image_generation &&
-					($user?.role === 'admin' || $user?.permissions?.features?.image_generation)
-						? imageGenerationEnabled
-						: false,
-				image_generation_options:
-					imageGenerationEnabled &&
-					$config?.features?.enable_image_generation &&
-					($user?.role === 'admin' || $user?.permissions?.features?.image_generation)
-						? getImageGenerationOptionsPayload()
-						: undefined,
+				image_generation: imageGenerationActive,
+				image_generation_options: imageGenerationActive
+					? getImageGenerationOptionsPayload()
+					: undefined,
 				code_interpreter:
 					$config?.features?.enable_code_interpreter &&
 					($user?.role === 'admin' || $user?.permissions?.features?.code_interpreter)
@@ -886,7 +1114,7 @@
 			},
 			session_id: $socket?.id ?? undefined,
 			chat_id: $chatId ?? undefined,
-			model_item: getModelById(model.id),
+			model_item: model,
 			...(stream && shouldIncludeUsageStreamOption(model)
 				? {
 						stream_options: {
@@ -909,6 +1137,13 @@
 	const canUseChatWebSearch = () =>
 		isChatWebSearchFeatureEnabled() &&
 		($user?.role === 'admin' || $user?.permissions?.features?.web_search);
+
+	$: {
+		const dedicatedImageModel = getSingleSelectedDedicatedImageModel();
+		if (dedicatedImageModel && canUseChatImageGeneration() && !imageGenerationEnabled) {
+			imageGenerationEnabled = true;
+		}
+	}
 
 	const decodeTokenUserId = (token: string | null | undefined): string | null => {
 		if (!token || typeof atob !== 'function') {
@@ -987,13 +1222,51 @@
 	};
 
 	const getImageGenerationOptionsPayload = () => {
-		const raw = imageGenerationOptions ?? {};
-		const payload = Object.fromEntries(
-			Object.entries(raw).filter(
-				([, value]) => value !== undefined && value !== null && value !== ''
-			)
-		);
+		const payload = sanitizeChatImageGenerationOptions(imageGenerationOptions);
+		const dedicatedImageModel = getSingleSelectedDedicatedImageModel();
+		if (dedicatedImageModel?.id) {
+			payload.model = getModelRequestId(dedicatedImageModel);
+			const modelRef = getModelRef(dedicatedImageModel);
+			if (modelRef) {
+				payload.model_ref = modelRef;
+			}
+		}
 		return Object.keys(payload).length > 0 ? payload : undefined;
+	};
+
+	const chatImageGenerationOptionKeys = [
+		'model',
+		'model_ref',
+		'image_size',
+		'aspect_ratio',
+		'resolution',
+		'n',
+		'negative_prompt',
+		'credential_source',
+		'connection_index',
+		'steps',
+		'background'
+	] as const;
+
+	const sanitizeChatImageGenerationOptions = (options: unknown): ImageGenerationOptions => {
+		if (!options || typeof options !== 'object' || Array.isArray(options)) {
+			return {};
+		}
+
+		const raw = options as Record<string, unknown>;
+		const payload: Record<string, unknown> = {};
+		for (const key of chatImageGenerationOptionKeys) {
+			const value = raw[key];
+			if (value === undefined || value === null || value === '') {
+				continue;
+			}
+			if (key === 'model_ref' && (typeof value !== 'object' || Array.isArray(value))) {
+				continue;
+			}
+			payload[key] = value;
+		}
+
+		return payload as ImageGenerationOptions;
 	};
 
 	const supportsToolValvesContext = (id: string | null | undefined): id is string =>
@@ -1111,7 +1384,7 @@
 		web_search_mode: webSearchMode,
 		web_search_mode_source: webSearchModeSource,
 		image_generation_enabled: imageGenerationEnabled,
-		image_generation_options: imageGenerationOptions,
+		image_generation_options: sanitizeChatImageGenerationOptions(imageGenerationOptions),
 		code_interpreter_enabled: codeInterpreterEnabled,
 		reasoning_effort: reasoningEffort,
 		max_thinking_tokens: maxThinkingTokens
@@ -1129,7 +1402,7 @@
 		activeAssistant,
 		systemPrompt: typeof params?.system === 'string' ? params.system : null,
 		imageGenerationEnabled,
-		imageGenerationOptions,
+		imageGenerationOptions: sanitizeChatImageGenerationOptions(imageGenerationOptions),
 		codeInterpreterEnabled,
 		reasoningEffort,
 		maxThinkingTokens
@@ -1216,8 +1489,9 @@
 			state.image_generation_options !== undefined ||
 			state.imageGenerationOptions !== undefined
 		) {
-			imageGenerationOptions =
-				state.image_generation_options ?? state.imageGenerationOptions ?? {};
+			imageGenerationOptions = sanitizeChatImageGenerationOptions(
+				state.image_generation_options ?? state.imageGenerationOptions ?? {}
+			);
 		}
 		if (
 			state.code_interpreter_enabled !== undefined ||
@@ -1611,6 +1885,7 @@
 		persistedSelectionThreads: PersistedSelectionThreads = selectionThreads
 	) => ({
 		models: selectedModels,
+		model_selection_hints: buildPersistedModelSelectionHints(selectedModels),
 		history: historyState,
 		messages,
 		params,
@@ -1776,7 +2051,12 @@
 		if (value) {
 			try {
 				const stored = JSON.parse(value);
-				const valid = stored.filter((id: string) => modelsMap.has(id));
+				const valid = stored
+					.map((id: string) => {
+						const resolution = resolveChatModelSelection($models, { value: id });
+						return resolution.status === 'resolved' ? resolution.value : resolution.value;
+					})
+					.filter((id: string) => id);
 				if (valid.length > 0) {
 					selectedModels = valid;
 					if (usedLegacy) {
@@ -2508,6 +2788,7 @@
 			if (urlModels.length === 1) {
 				const m = getModelById(urlModels[0]);
 				if (!m) {
+					selectedModels = [getCanonicalModelId(urlModels[0]) || ''];
 					const modelSelectorButton = document.getElementById('model-selector-0-button');
 					if (modelSelectorButton) {
 						modelSelectorButton.click();
@@ -2521,10 +2802,10 @@
 						}
 					}
 				} else {
-					selectedModels = urlModels;
+					selectedModels = urlModels.map((id) => getCanonicalModelId(id)).filter(Boolean);
 				}
 			} else {
-				selectedModels = urlModels;
+				selectedModels = urlModels.map((id) => getCanonicalModelId(id)).filter(Boolean);
 			}
 		} else if (!fresh && $selectedAssistantScene?.id) {
 			selectedModels = [$selectedAssistantScene.id];
@@ -2557,14 +2838,24 @@
 		// filtering against an empty modelsMap would discard the valid sessionStorage value.
 		// The recovery block (line 573) and ModelSelector validation handle deferred validation.
 		if (modelsMap.size > 0) {
-			selectedModels = selectedModels.filter((modelId) => modelsMap.has(modelId));
+			const hadExplicitSelectedModels = selectedModels.some(
+				(modelId) => `${modelId ?? ''}`.trim() !== ''
+			);
+			selectedModels = selectedModels
+				.map((modelId) => {
+					const resolution = resolveChatModelSelection($models, { value: modelId });
+					return resolution.status === 'resolved' ? resolution.value : resolution.value;
+				})
+				.filter((modelId) => modelId);
 			if (
 				selectedModels.length === 0 ||
 				(selectedModels.length === 1 && selectedModels[0] === '')
 			) {
-				if (!fresh && $models.length > 0) {
+				if (hadExplicitSelectedModels) {
+					selectedModels = [''];
+				} else if (!fresh && $models.length > 0) {
 					// Non-fresh: auto-select first available model as fallback
-					selectedModels = [$models[0].id];
+					selectedModels = [getModelSelectionId($models[0])];
 				} else {
 					// Fresh with no default: keep empty so user must choose
 					selectedModels = [''];
@@ -2718,7 +3009,10 @@
 
 		// Only validate model IDs when models are actually loaded
 		if (modelsMap.size > 0) {
-			selectedModels = selectedModels.map((modelId) => (modelsMap.has(modelId) ? modelId : ''));
+			selectedModels = selectedModels.map((modelId) => {
+				const resolution = resolveChatModelSelection($models, { value: modelId });
+				return resolution.status === 'resolved' ? resolution.value : resolution.value;
+			});
 		}
 
 		const userSettings = await getUserSettings(localStorage.token);
@@ -2816,14 +3110,23 @@
 			const chatContent = chat.chat;
 
 			if (chatContent) {
-				selectedModels =
-					(chatContent?.models ?? undefined) !== undefined
-						? chatContent.models
-						: [chatContent.models ?? ''];
+				if ($models.length === 0) {
+					await ensureModels(localStorage.token, { reason: 'chat-history-model-recovery' }).catch(() => {});
+					await tick();
+				}
+
+				const loadedModels =
+					(chatContent?.models ?? undefined) !== undefined ? chatContent.models : chatContent.model;
 				history =
 					(chatContent?.history ?? undefined) !== undefined
 						? chatContent.history
 						: convertMessagesToHistory(chatContent.messages);
+				selectedModels =
+					modelsMap.size > 0
+						? recoverLoadedChatModelState(chatContent, history, loadedModels)
+						: Array.isArray(loadedModels)
+							? loadedModels
+							: [loadedModels ?? ''];
 
 				chatTitle.set(chatContent.title);
 
@@ -3261,6 +3564,24 @@
 		});
 	};
 	const chatCompletedHandler = async (chatId, modelId, responseMessageId, messages) => {
+		const responseModelIndex = history.messages[responseMessageId]?.modelIdx ?? 0;
+		const responseModelResolution = resolveMessageModel(history.messages[responseMessageId]);
+		if (
+			isBlockingModelResolution(responseModelResolution) ||
+			responseModelResolution.status !== 'resolved'
+		) {
+			await promptModelResolution(responseModelResolution, responseModelIndex);
+			history.messages[responseMessageId].error = {
+				type: 'model_resolution_error',
+				content: responseModelResolution.status === 'ambiguous'
+					? $i18n.t('Model connection is ambiguous. Please select the model again.')
+					: $i18n.t('Model connection is unavailable. Please select the model again.')
+			};
+			await saveChatHandler(chatId, history);
+			return;
+		}
+		applyResolvedMessageModel(history.messages[responseMessageId], responseModelResolution);
+		modelId = responseModelResolution.value;
 		const res = await chatCompleted(localStorage.token, {
 			model: modelId,
 			messages: messages.map((m) => ({
@@ -3276,9 +3597,24 @@
 			chat_id: chatId,
 			session_id: $socket?.id,
 			id: responseMessageId
-		}).catch((error) => {
-			toast.error(`${error}`);
-			messages.at(-1).error = { content: error };
+		}).catch(async (error) => {
+			const resolutionDetail = getModelResolutionDetail(error);
+			if (resolutionDetail) {
+				await promptModelReselection({
+					index: responseModelIndex,
+					rawModelId: resolutionDetail.requestedModelId || `${modelId ?? ''}`.trim(),
+					ambiguous: resolutionDetail.code === MODEL_CONNECTION_AMBIGUOUS_CODE
+				});
+				messages.at(-1).error = {
+					type: 'model_resolution_error',
+					content: resolutionDetail.message || formatError(error),
+					detail: resolutionDetail
+				};
+				return null;
+			}
+
+			toast.error(formatError(error));
+			messages.at(-1).error = { content: formatError(error) };
 
 			return null;
 		});
@@ -3330,6 +3666,24 @@
 
 	const chatActionHandler = async (chatId, actionId, modelId, responseMessageId, event = null) => {
 		const messages = createMessagesList(history, responseMessageId);
+		const responseModelIndex = history.messages[responseMessageId]?.modelIdx ?? 0;
+		const responseModelResolution = resolveMessageModel(history.messages[responseMessageId]);
+		if (
+			isBlockingModelResolution(responseModelResolution) ||
+			responseModelResolution.status !== 'resolved'
+		) {
+			await promptModelResolution(responseModelResolution, responseModelIndex);
+			history.messages[responseMessageId].error = {
+				type: 'model_resolution_error',
+				content: responseModelResolution.status === 'ambiguous'
+					? $i18n.t('Model connection is ambiguous. Please select the model again.')
+					: $i18n.t('Model connection is unavailable. Please select the model again.')
+			};
+			await saveChatHandler(chatId, history);
+			return;
+		}
+		applyResolvedMessageModel(history.messages[responseMessageId], responseModelResolution);
+		modelId = responseModelResolution.value;
 
 		const res = await chatAction(localStorage.token, actionId, {
 			model: modelId,
@@ -3346,9 +3700,24 @@
 			chat_id: chatId,
 			session_id: $socket?.id,
 			id: responseMessageId
-		}).catch((error) => {
-			toast.error(`${error}`);
-			messages.at(-1).error = { content: error };
+		}).catch(async (error) => {
+			const resolutionDetail = getModelResolutionDetail(error);
+			if (resolutionDetail) {
+				await promptModelReselection({
+					index: responseModelIndex,
+					rawModelId: resolutionDetail.requestedModelId || `${modelId ?? ''}`.trim(),
+					ambiguous: resolutionDetail.code === MODEL_CONNECTION_AMBIGUOUS_CODE
+				});
+				messages.at(-1).error = {
+					type: 'model_resolution_error',
+					content: resolutionDetail.message || formatError(error),
+					detail: resolutionDetail
+				};
+				return null;
+			}
+
+			toast.error(formatError(error));
+			messages.at(-1).error = { content: formatError(error) };
 			return null;
 		});
 
@@ -3495,9 +3864,9 @@
 				role: 'assistant',
 				content: `[RESPONSE] ${responseMessageId}`,
 				done: true,
-
 				model: modelId,
-				modelName: getModelChatDisplayName(model) || model.id,
+				modelName: getModelChatDisplayName(model) || model?.id || modelId,
+				...(getModelRef(model) ? { model_ref: getModelRef(model) } : {}),
 				modelIdx: 0,
 				timestamp: Math.floor(Date.now() / 1000)
 			};
@@ -3556,8 +3925,9 @@
 					parentId: currentParentId,
 					childrenIds: [],
 					done: true,
-					model: model.id,
-					modelName: getModelChatDisplayName(model) || model.id,
+					model: model ? getModelRequestId(model) : modelId,
+					modelName: getModelChatDisplayName(model) || model?.id || modelId,
+					...(getModelRef(model) ? { model_ref: getModelRef(model) } : {}),
 					modelIdx: 0,
 					timestamp: Math.floor(Date.now() / 1000),
 					...message
@@ -3777,12 +4147,11 @@
 
 	const submitPrompt = async (userPrompt, { _raw = false } = {}) => {
 		const messages = createMessagesList(history, history.currentId);
-		const _selectedModels = selectedModels.map((modelId) =>
-			modelsMap.has(modelId) ? modelId : ''
-		);
-		if (JSON.stringify(selectedModels) !== JSON.stringify(_selectedModels)) {
-			selectedModels = _selectedModels;
-		}
+		const blockingSelection = findBlockingSelectedModelResolution();
+		const _selectedModels = selectedModels.map((modelId, index) => {
+			const resolution = resolveSelectedModel(modelId, index);
+			return resolution.status === 'resolved' ? resolution.value : '';
+		});
 
 		const failedFiles = files.filter((file) => isFailedUploadFile(file));
 		const validFiles = files.filter((file) => !isFailedUploadFile(file));
@@ -3798,6 +4167,13 @@
 			}
 			toast.error($i18n.t('Please enter a prompt'));
 			return;
+		}
+		if (blockingSelection) {
+			await promptModelResolution(blockingSelection.resolution, blockingSelection.index);
+			return;
+		}
+		if (JSON.stringify(selectedModels) !== JSON.stringify(_selectedModels)) {
+			selectedModels = _selectedModels;
 		}
 		if (selectedModels.includes('')) {
 			toast.error($i18n.t('Model not selected'));
@@ -3921,11 +4297,46 @@
 
 		const responseMessageIds: Record<PropertyKey, string> = {};
 		// If modelId is provided, use it, else use selected model
-		let selectedModelIds = modelId
-			? [modelId]
-			: atSelectedModel !== undefined
-				? [atSelectedModel.id]
-				: selectedModels;
+		let selectedModelIds = [];
+		if (modelId) {
+			const requestedModelId = `${modelId ?? ''}`.trim();
+			const sourceMessage =
+				typeof modelIdx === 'number'
+					? Object.values(history.messages).find(
+							(message: any) => message?.role === 'assistant' && message?.model === requestedModelId
+						)
+					: null;
+			const resolution = resolveChatModelSelection($models, {
+				value: requestedModelId,
+				model_ref: (sourceMessage as any)?.model_ref,
+				display_name: (sourceMessage as any)?.modelName
+			});
+			if (isBlockingModelResolution(resolution) || resolution.status !== 'resolved') {
+				await promptModelResolution(resolution, typeof modelIdx === 'number' ? modelIdx : 0);
+				return;
+			}
+			selectedModelIds = [resolution.value];
+		} else {
+			const rawSelectedModelIds =
+				atSelectedModel !== undefined ? [getModelSelectionId(atSelectedModel)] : selectedModels;
+			for (const [index, rawModelId] of rawSelectedModelIds.entries()) {
+				const resolution =
+					atSelectedModel !== undefined
+						? resolveChatModelSelection($models, { value: rawModelId })
+						: resolveSelectedModel(rawModelId, index);
+				if (isBlockingModelResolution(resolution) || resolution.status !== 'resolved') {
+					await promptModelResolution(resolution, index);
+					return;
+				}
+				selectedModelIds.push(resolution.value);
+			}
+			if (
+				atSelectedModel === undefined &&
+				JSON.stringify(selectedModels) !== JSON.stringify(selectedModelIds)
+			) {
+				selectedModels = selectedModelIds;
+			}
+		}
 
 		// Create response messages for each selected model
 		for (const [_modelIdx, modelId] of selectedModelIds.entries()) {
@@ -3939,8 +4350,9 @@
 					childrenIds: [],
 					role: 'assistant',
 					content: '',
-					model: model.id,
+					model: getModelRequestId(model),
 					modelName: getModelChatDisplayName(model) || model.id,
+					...(getModelRef(model) ? { model_ref: getModelRef(model) } : {}),
 					modelIdx: modelIdx ? modelIdx : _modelIdx,
 					userContext: null,
 					timestamp: Math.floor(Date.now() / 1000), // Unix epoch
@@ -4027,7 +4439,7 @@
 					}
 					responseMessage.userContext = userContext;
 
-					const chatEventEmitter = await getChatEventEmitter(model.id, _chatId);
+					const chatEventEmitter = await getChatEventEmitter(getModelRequestId(model), _chatId);
 
 					resetAutoScrollLock();
 					scrollToBottom();
@@ -4143,6 +4555,12 @@
 		}
 
 		const requestSkillIds = collectRequestSkillIds(messages);
+		const requestedWebSearchMode = canUseChatWebSearch()
+			? normalizeWebSearchMode(webSearchMode, 'off')
+			: 'off';
+		const imageGenerationActive = canUseChatImageGeneration()
+			? isImageGenerationActiveForRequest()
+			: false;
 
 		messages = messages
 			.map((message, idx, arr) => {
@@ -4157,19 +4575,24 @@
 					textContent = `${textContent}\n\n${_pendingInstruction}`;
 				}
 
+				const imageFiles = message.files?.filter((file) => file.type === 'image') ?? [];
+				const includeImagesInContent =
+					imageFiles.length > 0 && (message.role === 'user' || imageGenerationActive);
+
 				return {
 					role: message.role,
-					...((message.files?.filter((file) => file.type === 'image').length > 0 ?? false) &&
-					message.role === 'user'
+					...(includeImagesInContent
 						? {
 								content: [
-									{
-										type: 'text',
-										text: textContent
-									},
-									...message.files
-										.filter((file) => file.type === 'image')
-										.map((file) => ({
+									...(textContent
+										? [
+												{
+													type: 'text',
+													text: textContent
+												}
+											]
+										: []),
+									...imageFiles.map((file) => ({
 										type: 'image_url',
 										image_url: {
 											url: buildModelImageRequestUrl(file)
@@ -4182,17 +4605,21 @@
 							})
 				};
 			})
-			.filter((message) => message?.role === 'user' || message?.content?.trim());
-
-		const requestedWebSearchMode = canUseChatWebSearch()
-			? normalizeWebSearchMode(webSearchMode, 'off')
-			: 'off';
+			.filter((message) => {
+				if (message?.role === 'user') {
+					return true;
+				}
+				if (Array.isArray(message?.content)) {
+					return message.content.length > 0;
+				}
+				return message?.content?.trim();
+			});
 
 		const res = await generateOpenAIChatCompletion(
 			localStorage.token,
 			{
 				stream: stream,
-				model: model.id,
+				model: getModelRequestId(model),
 				messages: messages,
 				params: {
 					...$settings?.params,
@@ -4220,17 +4647,10 @@
 
 				features: {
 					memory: $settings?.memory ?? false,
-					image_generation:
-						$config?.features?.enable_image_generation &&
-						($user?.role === 'admin' || $user?.permissions?.features?.image_generation)
-							? imageGenerationEnabled
-							: false,
-					image_generation_options:
-						imageGenerationEnabled &&
-						$config?.features?.enable_image_generation &&
-						($user?.role === 'admin' || $user?.permissions?.features?.image_generation)
-							? getImageGenerationOptionsPayload()
-							: undefined,
+					image_generation: imageGenerationActive,
+					image_generation_options: imageGenerationActive
+						? getImageGenerationOptionsPayload()
+						: undefined,
 					code_interpreter:
 						$config?.features?.enable_code_interpreter &&
 						($user?.role === 'admin' || $user?.permissions?.features?.code_interpreter)
@@ -4250,18 +4670,19 @@
 							: undefined
 					)
 				},
-				model_item: getModelById(model.id),
+				model_item: model,
 
 				session_id: $socket?.id,
 				chat_id: $chatId,
 				id: responseMessageId,
 
 				...(!$temporaryChatEnabled &&
+				!imageGenerationActive &&
 				(messages.length == 1 ||
 					(messages.length == 2 &&
 						messages.at(0)?.role === 'system' &&
 						messages.at(1)?.role === 'user')) &&
-				(selectedModels[0] === model.id || atSelectedModel !== undefined)
+				(selectedModels[0] === getModelRequestId(model) || atSelectedModel !== undefined)
 					? {
 							background_tasks: {
 								title_generation: $settings?.title?.auto ?? true,
@@ -4269,7 +4690,9 @@
 								follow_up_generation: $settings?.autoFollowUps ?? true
 							}
 						}
-					: !$temporaryChatEnabled && ($settings?.autoFollowUps ?? true)
+					: !$temporaryChatEnabled &&
+					  !imageGenerationActive &&
+					  ($settings?.autoFollowUps ?? true)
 						? {
 								background_tasks: {
 									follow_up_generation: true
@@ -4287,15 +4710,25 @@
 			},
 			`${WEBUI_BASE_URL}/api`
 		).catch(async (error) => {
-			toast.error(`${error}`);
+			const resolutionDetail = getModelResolutionDetail(error);
+			if (resolutionDetail) {
+				await promptModelReselection({
+					index: responseMessage.modelIdx ?? 0,
+					rawModelId: resolutionDetail.requestedModelId || getModelRequestId(model),
+					ambiguous: resolutionDetail.code === MODEL_CONNECTION_AMBIGUOUS_CODE
+				});
+				responseMessage.error = {
+					type: 'model_resolution_error',
+					content: resolutionDetail.message || `${error}`,
+					detail: resolutionDetail
+				};
+				responseMessage.done = true;
+				history.messages[responseMessageId] = responseMessage;
+				history.currentId = responseMessageId;
+				return null;
+			}
 
-			responseMessage.error = {
-				content: error
-			};
-			responseMessage.done = true;
-
-			history.messages[responseMessageId] = responseMessage;
-			history.currentId = responseMessageId;
+			await handleOpenAIError(error, responseMessage);
 			return null;
 		});
 
@@ -4327,6 +4760,15 @@
 		if (typeof innerError === 'object') {
 			if ('detail' in innerError && typeof innerError.detail === 'string') {
 				return innerError.detail;
+			}
+			if (
+				'detail' in innerError &&
+				innerError.detail &&
+				typeof innerError.detail === 'object' &&
+				'message' in innerError.detail &&
+				typeof innerError.detail.message === 'string'
+			) {
+				return innerError.detail.message;
 			}
 
 			if ('error' in innerError) {
@@ -4412,6 +4854,9 @@
 		if (status === 429) {
 			return 'rate_limited';
 		}
+		if (status === 524) {
+			return 'cloudflare_timeout';
+		}
 		if (status === 408 || status === 504) {
 			return 'timeout';
 		}
@@ -4477,6 +4922,9 @@
 		if (family === 'rate_limited') {
 			return ['api_rate_limit', 'api_quota_exceeded'];
 		}
+		if (family === 'cloudflare_timeout') {
+			return ['api_cloudflare_origin_timeout', 'api_request_timeout', 'proxy_error'];
+		}
 		if (family === 'timeout') {
 			return ['api_request_timeout'];
 		}
@@ -4493,7 +4941,7 @@
 		if (family === 'auth_error') {
 			return 'check_api_key';
 		}
-		if (family === 'rate_limited' || family === 'timeout') {
+		if (family === 'rate_limited' || family === 'timeout' || family === 'cloudflare_timeout') {
 			return 'wait_retry';
 		}
 		if (family === 'upstream_service_error' && status !== null && status >= 500) {
@@ -4525,6 +4973,10 @@
 				return status
 					? $i18n.t('error.title.timeout', { status: statusValue })
 					: $i18n.t('error.title.timeout_no_status');
+			case 'cloudflare_timeout':
+				return status
+					? $i18n.t('error.title.cloudflare_timeout', { status: statusValue })
+					: $i18n.t('error.title.cloudflare_timeout_no_status');
 			default:
 				return status
 					? $i18n.t('error.title.upstream_service_error', { status: statusValue })
@@ -4742,11 +5194,35 @@
 			responseMessage.done = false;
 			await tick();
 
-			const model = getModelById(responseMessage.model);
+			const requestedModelId = `${responseMessage?.model ?? ''}`.trim();
+			const resolution = resolveMessageModel(responseMessage);
+			if (isBlockingModelResolution(resolution) || resolution.status !== 'resolved') {
+				await promptModelResolution(resolution, responseMessage.modelIdx ?? 0);
+				responseMessage.done = true;
+				history.messages[history.currentId] = responseMessage;
+				return;
+			}
+
+			const model = getModelById(resolution.value);
 
 			if (model) {
+				responseMessage.model = getModelRequestId(model);
+				const modelRef = getModelRef(model);
+				if (modelRef) {
+					responseMessage.model_ref = modelRef;
+				}
+				history.messages[history.currentId] = responseMessage;
 				await sendPromptSocket(history, model, responseMessage.id, _chatId);
+				return;
 			}
+
+			responseMessage.done = true;
+			history.messages[history.currentId] = responseMessage;
+			await promptModelReselection({
+				index: responseMessage.modelIdx ?? 0,
+				rawModelId: requestedModelId,
+				ambiguous: false
+			});
 		}
 	};
 
@@ -4971,6 +5447,9 @@
 									onBranchMessage={branchMessageToCurrentChat}
 									{branchingMessageId}
 									branchSupported={Boolean($chatId && $chatId !== 'local' && !$temporaryChatEnabled)}
+									initialMessagesCount={chatIdProp ? 6 : 20}
+									messagesLoadStep={chatIdProp ? 6 : 20}
+									deferOffscreenRendering={Boolean(chatIdProp)}
 									bottomPadding={files.length > 0}
 								/>
 								<div bind:this={scrollSentinel} class="h-px w-full shrink-0" />
@@ -5124,6 +5603,7 @@
 				{stopResponse}
 				{showMessage}
 				{eventTarget}
+				{imageGenerationEnabled}
 				{currentValvesContext}
 			/>
 		</PaneGroup>

@@ -23,6 +23,13 @@
 	import InlineDirtyActions from '$lib/components/admin/Settings/InlineDirtyActions.svelte';
 	import { DEFAULT_MODEL_ICON, resolveModelIcon } from '$lib/utils/model-icons';
 	import { getModelBaseName, getModelChatDisplayName } from '$lib/utils/model-display';
+	import {
+		findModelByIdentity,
+		findModelByRef,
+		getModelRef,
+		getModelSelectionId,
+		resolveModelSelectionId
+	} from '$lib/utils/model-identity';
 	import { cloneSettingsSnapshot, isSettingsSnapshotEqual } from '$lib/utils/settings-dirty';
 	import { getTools } from '$lib/apis/tools';
 	import { getFunctions } from '$lib/apis/functions';
@@ -171,9 +178,7 @@
 	};
 
 	const getMatchedProfileImage = (baseModelId: string | null) => {
-		const baseModel = baseModelId
-			? $models.find((candidate) => candidate.id === baseModelId)
-			: null;
+		const baseModel = baseModelId ? findModelByIdentity($models, baseModelId) : null;
 
 		const resolved = baseModel
 			? resolveModelIcon(baseModel as any)
@@ -399,8 +404,26 @@
 	const isBaseModelOption = (candidate: any) =>
 		(candidate?.info?.base_model_id ?? candidate?.base_model_id ?? null) == null;
 
+	const findBaseModelOption = (baseModelId: string | null | undefined, sourceModel: any = null) => {
+		const candidates = ($models ?? []).filter((m) => isBaseModelOption(m));
+		const ids = [
+			baseModelId,
+			baseModelId ? `${baseModelId}:latest` : '',
+			resolveModelSelectionId($models, baseModelId ?? ''),
+			sourceModel?.meta?.base_selection_id
+		].filter((id) => typeof id === 'string' && id.trim() !== '');
+
+		const direct = candidates.find(
+			(m) => ids.includes(getModelSelectionId(m)) || ids.includes(m.id)
+		);
+		if (direct) return direct;
+
+		const baseModelRef = sourceModel?.meta?.base_model_ref ?? sourceModel?.meta?.model_ref ?? null;
+		return findModelByRef(candidates, baseModelRef, sourceModel?.meta?.base_selection_id ?? baseModelId);
+	};
+
 	const addUsage = (base_model_id) => {
-		const baseModel = $models.find((m) => m.id === base_model_id);
+		const baseModel = findModelByIdentity($models, base_model_id);
 
 		if (baseModel) {
 			if (baseModel.owned_by === 'openai') {
@@ -438,6 +461,20 @@
 			loading = false;
 			saving = false;
 			return;
+		}
+		if (preset && modelInfo.base_model_id) {
+			const baseModel = findBaseModelOption(modelInfo.base_model_id, modelInfo);
+			const baseModelRef = getModelRef(baseModel);
+			modelInfo.base_model_id = baseModel
+				? getModelSelectionId(baseModel)
+				: modelInfo.base_model_id;
+			if (baseModelRef) {
+				modelInfo.meta.base_model_ref = baseModelRef;
+				modelInfo.meta.base_selection_id = getModelSelectionId(baseModel);
+			} else if (!modelInfo.meta.base_model_ref && !modelInfo.meta.base_selection_id) {
+				delete modelInfo.meta.base_model_ref;
+				delete modelInfo.meta.base_selection_id;
+			}
 		}
 
 		if (Object.keys(builtinToolConfig).length > 0) {
@@ -541,19 +578,12 @@
 			enableDescription = model?.meta?.description !== null;
 
 			if (model.base_model_id) {
-				const base_model = $models
-					// Shared base models can be marked as preset by the backend when injected
-					// from the owner's connections, so we must detect true base models by
-					// the absence of an upstream base_model_id instead of `preset`.
-					.filter((m) => isBaseModelOption(m))
-					.find((m) => [model.base_model_id, `${model.base_model_id}:latest`].includes(m.id));
+				const base_model = findBaseModelOption(model.base_model_id, model);
 
 				console.log('base_model', base_model);
 
 				if (base_model) {
-					model.base_model_id = base_model.id;
-				} else {
-					model.base_model_id = null;
+					model.base_model_id = getModelSelectionId(base_model);
 				}
 			}
 
@@ -854,7 +884,7 @@
 											...$models
 												.filter((m) => (model ? m.id !== model.id : true) && isBaseModelOption(m))
 												.map((m) => ({
-													value: m.id,
+													value: getModelSelectionId(m),
 													label: getModelChatDisplayName(m)
 												}))
 										]}

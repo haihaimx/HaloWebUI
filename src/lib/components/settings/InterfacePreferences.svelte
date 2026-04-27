@@ -18,6 +18,7 @@
 	import { getUserPosition } from '$lib/utils';
 	import { getLanguages, changeLanguage, translateWithDefault } from '$lib/i18n';
 	import { getModelChatDisplayName } from '$lib/utils/model-display';
+	import { getModelSelectionId, resolveModelSelectionId } from '$lib/utils/model-identity';
 	import { setTextScale } from '$lib/utils/text-scale';
 	import { revealExpandedSection } from '$lib/utils/expanded-section-scroll';
 
@@ -303,6 +304,11 @@
 	// Admin-only user preferences (still stored per-user)
 
 	const normalizeModelId = (value: string | null | undefined) => String(value ?? '').trim();
+	const resolveDefaultModelId = (value: string | null | undefined) => {
+		const normalized = normalizeModelId(value);
+		if (!normalized) return '';
+		return resolveModelSelectionId($models ?? [], normalized, { preserveAmbiguous: true }) || normalized;
+	};
 
 	const normalizeImageCompressionSize = (
 		value: { width?: string | number | null; height?: string | number | null } | null | undefined
@@ -335,7 +341,7 @@
 	};
 
 	const getEffectiveDefaultModelId = () => {
-		return normalizeModelId($settings?.models?.at(0));
+		return resolveDefaultModelId($settings?.models?.at(0));
 	};
 
 	const applyTheme = (rawTheme: string) => {
@@ -556,7 +562,7 @@
 			promptSuggestions
 		},
 		chat: {
-			defaultModelId: normalizeModelId(defaultModelId),
+			defaultModelId: resolveDefaultModelId(defaultModelId),
 			titleAutoGenerate,
 			autoTags,
 			autoFollowUps,
@@ -609,7 +615,7 @@
 	};
 
 	const applyLayoutSnapshot = (snapshot: SectionSnapshot['layout']) => {
-		defaultModelId = normalizeModelId(snapshot.defaultModelId);
+		defaultModelId = resolveDefaultModelId(snapshot.defaultModelId);
 		showChatTitleInTab = snapshot.showChatTitleInTab;
 		showFeaturedAssistantsOnHome = snapshot.showFeaturedAssistantsOnHome;
 		landingPageMode = snapshot.landingPageMode;
@@ -1002,7 +1008,7 @@
 		chatSaving = true;
 		try {
 			await saveSettings({
-				models: normalizeModelId(defaultModelId) ? [normalizeModelId(defaultModelId)] : [],
+				models: resolveDefaultModelId(defaultModelId) ? [resolveDefaultModelId(defaultModelId)] : [],
 				title: {
 					...($settings?.title ?? {}),
 					auto: titleAutoGenerate
@@ -1096,6 +1102,13 @@
 
 	let rootClass = 'flex flex-col space-y-6 text-sm';
 	let bodyClass = 'space-y-6 overflow-y-auto scrollbar-hidden';
+	$: if (($models?.length ?? 0) > 0 && defaultModelId) {
+		const resolved = resolveDefaultModelId(defaultModelId);
+		if (resolved && resolved !== defaultModelId) {
+			defaultModelId = resolved;
+		}
+	}
+
 	$: {
 		rootClass = embedded
 			? 'flex flex-col space-y-6 text-sm'
@@ -2064,7 +2077,7 @@
 													options={[
 														{ value: '', label: $i18n.t('None') },
 														...($models ?? []).map((m) => ({
-															value: m.id,
+															value: getModelSelectionId(m),
 															label: getModelChatDisplayName(m)
 														}))
 													]}
@@ -2207,20 +2220,17 @@
 												bind:state={scrollOnBranchChange}
 											/>
 										</div>
-										<div class="flex items-center justify-between glass-item px-4 py-3">
+										<div class="glass-item px-4 py-3">
 											<div class="text-sm font-medium">
-												{tr('按当前页面样式导出 PDF', 'Export PDF using current page style')}
+												{tr('PDF 导出说明', 'PDF export note')}
 											</div>
-											<Switch
-												bind:state={stylizedPdfExport}
-											/>
+											<div class="text-xs text-gray-500 dark:text-gray-400 mt-1.5 leading-5">
+												{tr(
+													'PDF 现已改为文档型导出，优先保证文字、列表、代码块和图片的稳定排版，不再跟随当前聊天页面视觉样式。',
+													'PDF export now uses a document layout to keep text, lists, code blocks, and images stable instead of mirroring the current chat page style.'
+												)}
+											</div>
 										</div>
-									</div>
-									<div class="text-xs text-gray-500 dark:text-gray-400 mt-1.5 pl-1">
-										{tr(
-											'开启：导出效果更接近当前聊天页面。关闭：使用简化兼容导出，速度更稳。',
-											'On: export stays closer to the current chat page. Off: use simplified export for better stability.'
-										)}
 									</div>
 
 									<!-- Sub-group C: Interaction -->

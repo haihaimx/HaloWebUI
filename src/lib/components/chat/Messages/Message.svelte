@@ -41,12 +41,17 @@
 	export let branchSupported = false;
 	export let triggerScroll;
 	export let readOnly = false;
+	export let forceExpandContent = false;
+	export let deferOffscreenRendering = false;
 </script>
 
 <div
 	class="flex flex-col justify-between px-4 sm:px-8 mb-3 w-full {($settings?.widescreenMode ?? null)
 		? 'max-w-full'
 		: 'max-w-5xl'} mx-auto rounded-lg group"
+	style={deferOffscreenRendering
+		? 'content-visibility: auto; contain-intrinsic-size: 0 900px;'
+		: ''}
 >
 	{#if history.messages[messageId]}
 		{#if history.messages[messageId].role === 'user'}
@@ -93,6 +98,7 @@
 				{branchingMessageId}
 				{branchSupported}
 				{readOnly}
+				{forceExpandContent}
 			/>
 		{:else}
 			<MultiResponseMessages
@@ -115,6 +121,7 @@
 				{branchingMessageId}
 				{branchSupported}
 				{readOnly}
+				{forceExpandContent}
 			/>
 		{/if}
 	{/if}

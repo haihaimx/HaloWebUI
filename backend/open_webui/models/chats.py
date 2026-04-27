@@ -7,6 +7,9 @@ from typing import Optional
 from open_webui.internal.db import Base, get_db
 from open_webui.models.tags import TagModel, Tag, Tags
 from open_webui.env import SRC_LOG_LEVELS
+from open_webui.utils.image_generation_options import (
+    sanitize_chat_payload_image_generation_options,
+)
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import BigInteger, Boolean, Column, Integer, String, Text, JSON, Index
@@ -248,6 +251,9 @@ class ChatTable:
         now: Optional[int] = None,
     ) -> Chat:
         normalized_chat = normalize_chat_payload(chat_payload)
+        normalized_chat, _changed = sanitize_chat_payload_image_generation_options(
+            normalized_chat
+        )
         now = now if now is not None else int(time.time())
         title = normalized_chat["title"] if "title" in normalized_chat else "New Chat"
 
@@ -350,6 +356,9 @@ class ChatTable:
         try:
             with get_db() as db:
                 normalized_chat = normalize_chat_payload(chat)
+                normalized_chat, _changed = sanitize_chat_payload_image_generation_options(
+                    normalized_chat
+                )
                 chat_item = db.get(Chat, id)
                 chat_item.chat = normalized_chat
                 flag_modified(chat_item, "chat")
@@ -372,9 +381,12 @@ class ChatTable:
             return None
 
         chat_dict = chat.chat or {}
+        sanitized_composer_state, _changed = sanitize_chat_payload_image_generation_options(
+            {"composer_state": composer_state if isinstance(composer_state, dict) else {}}
+        )
         next_chat = {
             **chat_dict,
-            "composer_state": composer_state if isinstance(composer_state, dict) else {},
+            "composer_state": sanitized_composer_state.get("composer_state", {}),
         }
 
         return self.update_chat_by_id(id, next_chat)
@@ -741,6 +753,18 @@ class ChatTable:
             with get_db() as db:
                 chat = db.query(Chat).filter_by(id=id, user_id=user_id).first()
                 return ChatModel.model_validate(chat)
+        except Exception:
+            return None
+
+    def get_chat_meta_by_id_and_user_id(self, id: str, user_id: str) -> Optional[dict]:
+        try:
+            with get_db() as db:
+                row = (
+                    db.query(Chat.meta)
+                    .filter_by(id=id, user_id=user_id)
+                    .first()
+                )
+                return row[0] if row else None
         except Exception:
             return None
 
@@ -1298,7 +1322,7 @@ class ChatMessageTable:
             # Collect non-core fields into meta
             meta_keys = {
                 "files", "sources", "code_executions", "statusHistory",
-                "childrenIds", "models", "modelName", "modelIdx",
+                "childrenIds", "models", "modelName", "modelIdx", "model_ref",
                 "done", "error", "info", "completedAt", "userContext",
                 "merged", "lastSentence", "originalContent",
             }

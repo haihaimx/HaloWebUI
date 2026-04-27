@@ -37,7 +37,6 @@ from open_webui.models.users import UserModel
 from open_webui.storage.provider import Storage
 from open_webui.utils.user_connections import (
     get_user_connections,
-    set_user_connection_provider_config,
 )
 
 from open_webui.constants import ERROR_MESSAGES
@@ -67,6 +66,14 @@ from open_webui.utils.native_web_search import (
     build_native_web_search_support,
     resolve_effective_native_web_search_support,
     strip_model_prefix,
+)
+from open_webui.utils.model_identity import (
+    decorate_provider_model_identity,
+    derive_connection_id,
+    get_base_model_ref_from_model_info,
+    get_model_ref_from_model,
+    resolve_model_from_lookup,
+    resolve_provider_connection_by_model_id,
 )
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
@@ -354,35 +361,23 @@ def _get_openai_user_config(connection_user: Optional[UserModel]) -> tuple[list[
 
 
 def _resolve_openai_connection_by_model_id(
-    model_id: str, base_urls: list[str], keys: list[str], cfgs: dict
+    model_id: str,
+    base_urls: list[str],
+    keys: list[str],
+    cfgs: dict,
+    *,
+    model_ref: Optional[dict] = None,
+    request_models=None,
 ) -> tuple[int, str, str, dict]:
-    """
-    Pick a connection index based on an internal `prefix_id` embedded in the model id.
-
-    - If model_id is "prefix_id.xxx", we match that prefix against cfgs[idx].prefix_id.
-    - Otherwise we use idx=0.
-    """
-    chosen_idx = 0
-    chosen_cfg = (cfgs.get("0") or {}) if isinstance(cfgs, dict) else {}
-    chosen_prefix = (chosen_cfg.get("prefix_id") or "").strip() or None
-
-    if isinstance(model_id, str) and "." in model_id and len(base_urls) > 1 and isinstance(cfgs, dict):
-        maybe_prefix, _rest = model_id.split(".", 1)
-        for idx, _url in enumerate(base_urls):
-            c = cfgs.get(str(idx), {}) or {}
-            p = (c.get("prefix_id") or "").strip() or None
-            if p and p == maybe_prefix:
-                chosen_idx = idx
-                chosen_cfg = c
-                chosen_prefix = p
-                break
-
-    url = (base_urls[chosen_idx] if chosen_idx < len(base_urls) else "").rstrip("/")
-    key = keys[chosen_idx] if chosen_idx < len(keys) else ""
-    api_config = chosen_cfg or {}
-    api_config = {**api_config, "_resolved_prefix_id": chosen_prefix or ""}
-
-    return chosen_idx, url, key, api_config
+    return resolve_provider_connection_by_model_id(
+        provider="openai",
+        model_id=model_id,
+        base_urls=base_urls,
+        keys=keys,
+        cfgs=cfgs,
+        model_ref=model_ref,
+        request_models=request_models,
+    )
 
 
 async def _is_user_visible_model(
@@ -390,7 +385,10 @@ async def _is_user_visible_model(
 ) -> bool:
     state = getattr(request, "state", None)
     models_map = getattr(state, "MODELS", None) if state is not None else None
-    if isinstance(models_map, dict) and model_id in models_map:
+    ambiguous_aliases = getattr(state, "MODELS_AMBIGUOUS", set()) if state is not None else set()
+    if isinstance(models_map, dict) and resolve_model_from_lookup(
+        models_map, ambiguous_aliases or set(), model_id
+    ):
         return True
 
     try:
@@ -409,7 +407,10 @@ async def _is_user_visible_model(
 
     state = getattr(request, "state", None)
     models_map = getattr(state, "MODELS", None) if state is not None else None
-    return isinstance(models_map, dict) and model_id in models_map
+    ambiguous_aliases = getattr(state, "MODELS_AMBIGUOUS", set()) if state is not None else set()
+    return isinstance(models_map, dict) and bool(
+        resolve_model_from_lookup(models_map, ambiguous_aliases or set(), model_id)
+    )
 
 
 ##########################################
@@ -1582,8 +1583,8 @@ async def get_all_models_responses(request: Request, user: UserModel) -> list:
 
     num_urls = len(base_urls)
 
-    # If multiple OpenAI-compatible connections exist, ensure every connection has a stable internal prefix_id.
-    # This avoids id collisions and prevents UI crashes due to duplicate keyed list items.
+    # If multiple OpenAI-compatible connections exist, derive a stable internal prefix_id in memory.
+    # Read paths must stay read-only so model discovery does not mutate user settings revisions.
     cfgs = cfgs or {}
     cfgs_changed = False
     if num_urls > 1:
@@ -1621,8 +1622,13 @@ async def get_all_models_responses(request: Request, user: UserModel) -> list:
                 if preserved_empty_idx == idx:
                     prefix_id = ""
                 else:
-                    prefix_id = secrets.token_hex(4)
-                    cfgs_changed = True
+                    prefix_id = derive_connection_id(
+                        provider="openai",
+                        source="personal",
+                        url=url,
+                        api_key=keys[idx] if idx < len(keys) else "",
+                        auth_type=api_config.get("auth_type"),
+                    )
 
             if prefix_id:
                 if prefix_id in used:
@@ -1652,22 +1658,6 @@ async def get_all_models_responses(request: Request, user: UserModel) -> list:
             if cfgs.get(key) != next_cfg:
                 cfgs_changed = True
             cfgs[key] = next_cfg
-
-    # Persist prefix_id/name normalization when needed (keeps model ids stable across sessions).
-    if cfgs_changed and user:
-        try:
-            set_user_connection_provider_config(
-                user.id,
-                "openai",
-                {
-                    "OPENAI_API_BASE_URLS": base_urls,
-                    "OPENAI_API_KEYS": keys,
-                    "OPENAI_API_CONFIGS": cfgs,
-                },
-            )
-        except Exception:
-            # Best-effort persistence; do not block model listing.
-            pass
 
     request_tasks = []
     for idx, url in enumerate(base_urls):
@@ -1774,6 +1764,10 @@ async def get_all_models_responses(request: Request, user: UserModel) -> list:
                 model["connection_name"] = connection_name
             if connection_icon:
                 model["connection_icon"] = connection_icon
+            model["source"] = "personal"
+            model["connection_index"] = idx
+            if prefix_id:
+                model["connection_id"] = prefix_id
             model["name"] = display_name
             model_support = resolve_effective_native_web_search_support(
                 connection_support,
@@ -1789,6 +1783,18 @@ async def get_all_models_responses(request: Request, user: UserModel) -> list:
             if prefix_id:
                 model["original_id"] = original_id
                 model["id"] = f"{prefix_id}.{original_id}"
+            else:
+                model["original_id"] = original_id
+
+            decorate_provider_model_identity(
+                model,
+                provider="openai",
+                model_id=original_id,
+                source="personal",
+                connection_index=idx,
+                connection_id=prefix_id,
+                legacy_ids=[model.get("id"), original_id],
+            )
 
         if tags:
             for model in response if isinstance(response, list) else response.get("data", []):
@@ -2339,20 +2345,37 @@ async def generate_chat_completion(
     if BYPASS_MODEL_ACCESS_CONTROL:
         bypass_filter = True
 
-    idx = 0
-
     payload = {**form_data}
     custom_params = payload.pop("custom_params", None)
     metadata = payload.pop("metadata", None)
 
-    model_id = form_data.get("model")
-    model_info = Models.get_model_by_id(model_id)
+    request_models = getattr(request.state, "MODELS", None) or getattr(
+        request.app.state, "MODELS", {}
+    )
+    requested_model_id = form_data.get("model")
+    request_model_entry = (
+        request_models.get(requested_model_id)
+        if isinstance(request_models, dict)
+        else None
+    )
+
+    model_id = requested_model_id
+    model_record_id = (
+        request_model_entry.get("id")
+        if isinstance(request_model_entry, dict)
+        else model_id
+    )
+    model_info = Models.get_model_by_id(model_id) or Models.get_model_by_id(
+        model_record_id
+    )
+    model_ref = get_model_ref_from_model(request_model_entry)
 
     # Check model info and override the payload
     if model_info:
         if model_info.base_model_id:
             payload["model"] = model_info.base_model_id
             model_id = model_info.base_model_id
+            model_ref = get_base_model_ref_from_model_info(model_info) or model_ref
 
         params = model_info.params.model_dump()
         payload = apply_model_params_to_body_openai(params, payload)
@@ -2384,9 +2407,23 @@ async def generate_chat_completion(
     if not base_urls:
         raise HTTPException(status_code=404, detail="No connections configured")
 
-    idx, url, key, api_config = _resolve_openai_connection_by_model_id(model_id, base_urls, keys, cfgs)
+    if not model_ref and isinstance(request_models, dict):
+        model_ref = get_model_ref_from_model(request_models.get(model_id))
+
+    idx, url, key, api_config = _resolve_openai_connection_by_model_id(
+        model_id,
+        base_urls,
+        keys,
+        cfgs,
+        model_ref=model_ref,
+        request_models=request_models,
+    )
     if not url:
         raise HTTPException(status_code=404, detail="Connection not found")
+
+    if api_config.get("_resolved_model_id"):
+        payload["model"] = api_config["_resolved_model_id"]
+        model_id = payload["model"]
 
     prefix_id = api_config.get("prefix_id", None)
     if prefix_id and isinstance(payload.get("model"), str):

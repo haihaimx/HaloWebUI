@@ -37,7 +37,6 @@ from open_webui.socket.main import (
 from open_webui.routers.tasks import (
     generate_queries,
     generate_title,
-    generate_image_prompt,
     generate_chat_tags,
     generate_follow_ups,
 )
@@ -70,6 +69,11 @@ from open_webui.routers.gemini import (
 )
 
 from open_webui.utils.webhook import post_webhook
+from open_webui.utils.chat_image_refs import extract_chat_image_file_id
+from open_webui.utils.image_generation_options import (
+    CHAT_IMAGE_GENERATION_OPTION_KEYS,
+    sanitize_chat_image_generation_options,
+)
 
 
 from open_webui.models.users import UserModel
@@ -91,12 +95,14 @@ from open_webui.retrieval.document_processing import (
 from open_webui.storage.provider import Storage
 
 
+from open_webui.utils.access_control import has_permission
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.native_web_search import (
     build_native_web_search_support,
     resolve_effective_native_web_search_support,
     strip_model_prefix,
 )
+from open_webui.utils.model_identity import get_model_ref_from_model, resolve_model_from_lookup
 from open_webui.utils.payload import merge_additive_payload_fields
 from open_webui.utils.skill_runtime import (
     build_skill_system_prompt,
@@ -105,6 +111,7 @@ from open_webui.utils.skill_runtime import (
 )
 from open_webui.utils.task import (
     get_task_model_id,
+    is_dedicated_image_generation_model,
     prompt_template,
     rag_template,
     tools_function_calling_generation_template,
@@ -448,6 +455,55 @@ def _extract_stream_content_and_files(
         return _extract_image_files_from_text(value)
 
     return "", []
+
+
+def _normalize_stream_reasoning_duration(seconds: Any) -> Optional[float]:
+    if not isinstance(seconds, (int, float)):
+        return None
+
+    duration_seconds = float(seconds)
+    if duration_seconds <= 0:
+        return None
+
+    rounded_duration = round(duration_seconds, 1)
+    return rounded_duration if rounded_duration > 0 else 0.1
+
+
+def _finalize_reasoning_block_duration(
+    block: Any, *, ended_at: Optional[float] = None
+) -> Optional[float]:
+    if not isinstance(block, dict):
+        return None
+
+    finished_at = (
+        float(ended_at) if isinstance(ended_at, (int, float)) else time.time()
+    )
+    started_at = block.get("started_at")
+    fallback_started_at = block.get("fallback_started_at")
+
+    duration = None
+    if isinstance(started_at, (int, float)):
+        duration = _normalize_stream_reasoning_duration(
+            finished_at - float(started_at)
+        )
+
+    if duration is None and isinstance(fallback_started_at, (int, float)):
+        duration = _normalize_stream_reasoning_duration(
+            finished_at - float(fallback_started_at)
+        )
+
+    if duration is None and (
+        isinstance(started_at, (int, float))
+        or isinstance(fallback_started_at, (int, float))
+    ):
+        duration = 0.1
+
+    if duration is None:
+        return None
+
+    block["ended_at"] = finished_at
+    block["duration"] = duration
+    return duration
 
 
 def _has_nonempty_text_content(content_blocks: Any) -> bool:
@@ -1037,7 +1093,12 @@ def _resolve_native_web_search_support(
             }
 
         _idx, url, _key, api_config = _resolve_openai_connection_by_model_id(
-            model_id, base_urls, keys, cfgs
+            model_id,
+            base_urls,
+            keys,
+            cfgs,
+            model_ref=get_model_ref_from_model(model),
+            request_models=getattr(getattr(request, "state", None), "MODELS", None),
         )
         if not url:
             return {
@@ -1080,7 +1141,12 @@ def _resolve_native_web_search_support(
             }
 
         _idx, url, _key, api_config = _resolve_gemini_connection_by_model_id(
-            model_id, base_urls, keys, cfgs
+            model_id,
+            base_urls,
+            keys,
+            cfgs,
+            model_ref=get_model_ref_from_model(model),
+            request_models=getattr(getattr(request, "state", None), "MODELS", None),
         )
         if not url:
             return {
@@ -1299,6 +1365,30 @@ def _extract_files_from_messages(messages: list[dict]) -> list[dict]:
                 })
 
     return result
+
+
+def _find_latest_image_url_from_messages(messages: Any) -> Optional[str]:
+    if not isinstance(messages, list):
+        return None
+
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+
+        normalized_files = _normalize_message_files(
+            [message.get("files"), message.get("content")]
+        )
+        for file_item in normalized_files:
+            if not isinstance(file_item, dict):
+                continue
+            if str(file_item.get("type") or "").strip().lower() != "image":
+                continue
+
+            url = str(file_item.get("url") or "").strip()
+            if url:
+                return url
+
+    return None
 
 
 def _get_attachment_file_id(file_item: Any) -> str:
@@ -1798,7 +1888,12 @@ async def _prepare_openai_native_file_inputs(
 
     model_id = form_data.get("model") or (model or {}).get("id") or ""
     url_idx, url, key, api_config = _resolve_openai_connection_by_model_id(
-        model_id, base_urls, keys, cfgs
+        model_id,
+        base_urls,
+        keys,
+        cfgs,
+        model_ref=get_model_ref_from_model(model),
+        request_models=getattr(getattr(request, "state", None), "MODELS", None),
     )
     if not url:
         return
@@ -2324,6 +2419,7 @@ async def chat_completion_tools_handler(
         request.app.state.config.TASK_MODEL,
         request.app.state.config.TASK_MODEL_EXTERNAL,
         models,
+        getattr(request.state, "MODELS_AMBIGUOUS", set()) or set(),
     )
 
     skip_files = False
@@ -2795,6 +2891,7 @@ async def chat_image_generation_handler(
     request: Request, form_data: dict, extra_params: dict, user
 ):
     __event_emitter__ = extra_params["__event_emitter__"]
+    __metadata__ = extra_params["__metadata__"]
     await __event_emitter__(
         {
             "type": "status",
@@ -2804,6 +2901,29 @@ async def chat_image_generation_handler(
 
     messages = form_data["messages"]
     user_message = get_last_user_message(messages)
+    source_image_url = _find_latest_image_url_from_messages(messages)
+    try:
+        source_file_id = extract_chat_image_file_id(source_image_url)
+        source_file = Files.get_file_by_id(source_file_id) if source_file_id else None
+        source_file_meta = (
+            source_file.meta
+            if source_file and isinstance(getattr(source_file, "meta", None), dict)
+            else {}
+        )
+        log.info(
+            "chat_image_generation_source user_id=%s source_image_url=%s source_file_id=%s source_file_name=%s source_file_size=%s",
+            getattr(user, "id", None),
+            source_image_url or "",
+            source_file_id or "",
+            (
+                source_file_meta.get("name")
+                or getattr(source_file, "filename", None)
+                or ""
+            ),
+            source_file_meta.get("size") or "",
+        )
+    except Exception:
+        pass
 
     prompt = user_message
     negative_prompt = ""
@@ -2811,40 +2931,9 @@ async def chat_image_generation_handler(
         extra_params.get("__metadata__", {})
         .get("image_generation_options", {})
     )
-    image_generation_options = (
-        image_generation_options if isinstance(image_generation_options, dict) else {}
+    image_generation_options = sanitize_chat_image_generation_options(
+        image_generation_options
     )
-
-    if request.app.state.config.ENABLE_IMAGE_PROMPT_GENERATION:
-        try:
-            res = await generate_image_prompt(
-                request,
-                {
-                    "model": form_data["model"],
-                    "messages": messages,
-                },
-                user,
-            )
-            response = _get_generation_response_content(res)
-            if not response:
-                raise ValueError("Image prompt generation returned no content")
-
-            try:
-                bracket_start = response.find("{")
-                bracket_end = response.rfind("}") + 1
-
-                if bracket_start == -1 or bracket_end == -1:
-                    raise Exception("No JSON object found in the response")
-
-                json_str = response[bracket_start:bracket_end]
-                parsed = json.loads(json_str)
-                prompt = parsed.get("prompt", [])
-            except Exception as e:
-                prompt = user_message
-
-        except Exception as e:
-            log.exception(e)
-            prompt = user_message
 
     system_message_content = ""
 
@@ -2856,20 +2945,15 @@ async def chat_image_generation_handler(
                     "prompt": prompt,
                     **{
                         key: image_generation_options.get(key)
-                        for key in (
-                            "model",
-                            "size",
-                            "image_size",
-                            "aspect_ratio",
-                            "n",
-                            "negative_prompt",
-                            "credential_source",
-                            "connection_index",
-                            "steps",
-                            "background",
-                        )
+                        for key in CHAT_IMAGE_GENERATION_OPTION_KEYS
                         if image_generation_options.get(key) is not None
                     },
+                    **(
+                        {"image_url": source_image_url}
+                        if source_image_url
+                        else {}
+                    ),
+                    "chat_generation": True,
                 }
             ),
             user=user,
@@ -2881,23 +2965,31 @@ async def chat_image_generation_handler(
                 "data": {"description": "Generated an image", "done": True},
             }
         )
-
-        await __event_emitter__(
-            {
-                "type": "files",
-                "data": {
-                    "files": [
-                        {
-                            "type": "image",
-                            "url": image["url"],
-                        }
-                        for image in images
-                    ]
-                },
-            }
+        image_usage = next(
+            (
+                image.get("usage")
+                for image in images
+                if isinstance(image, dict) and isinstance(image.get("usage"), dict)
+            ),
+            None,
         )
-
-        system_message_content = "<context>User is shown the generated image, tell the user that the image has been generated</context>"
+        __metadata__["local_response"] = {
+            **({"usage": image_usage} if image_usage else {}),
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "images": [
+                            {
+                                "type": "image",
+                                "url": image["url"],
+                            }
+                            for image in images
+                        ],
+                    }
+                }
+            ]
+        }
     except Exception as e:
         log.exception(e)
         await __event_emitter__(
@@ -2909,13 +3001,11 @@ async def chat_image_generation_handler(
                 },
             }
         )
-
-        system_message_content = "<context>Unable to generate an image, tell the user that an error occurred</context>"
-
-    if system_message_content:
-        form_data["messages"] = add_or_update_system_message(
-            system_message_content, form_data["messages"]
-        )
+        __metadata__["local_response"] = {
+            "error": {
+                "detail": str(e),
+            }
+        }
 
     return form_data
 
@@ -3102,6 +3192,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         request.app.state.config.TASK_MODEL,
         request.app.state.config.TASK_MODEL_EXTERNAL,
         models,
+        getattr(request.state, "MODELS_AMBIGUOUS", set()) or set(),
     )
 
     events = []
@@ -3169,6 +3260,100 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         raise Exception(f"Error: {e}")
 
     features = form_data.pop("features", None)
+    if features is not None and not isinstance(features, dict):
+        features = None
+    elif isinstance(features, dict):
+        features = dict(features)
+        if "image_generation_options" in features:
+            image_generation_options = sanitize_chat_image_generation_options(
+                features.get("image_generation_options")
+            )
+            if image_generation_options:
+                features["image_generation_options"] = image_generation_options
+            else:
+                features.pop("image_generation_options", None)
+
+    skip_text_enhancements = is_dedicated_image_generation_model(model)
+
+    if is_dedicated_image_generation_model(model):
+        image_generation_enabled = bool(
+            getattr(request.app.state.config, "ENABLE_IMAGE_GENERATION", False)
+        )
+        image_generation_allowed = user.role == "admin" or has_permission(
+            user.id, "features.image_generation", request.app.state.config.USER_PERMISSIONS
+        )
+
+        if image_generation_enabled and image_generation_allowed:
+            features = dict(features or {})
+            image_generation_options = sanitize_chat_image_generation_options(
+                features.get("image_generation_options")
+            )
+
+            selected_image_model = str(
+                model.get("model_id")
+                or model.get("original_id")
+                or model.get("id")
+                or form_data.get("model")
+                or ""
+            ).strip()
+            model_ref = {}
+            if isinstance(model, dict):
+                existing_model_ref = model.get("model_ref") if isinstance(model.get("model_ref"), dict) else {}
+                connection_index = existing_model_ref.get("connection_index", model.get("connection_index"))
+                api_config = model.get("api_config") if isinstance(model.get("api_config"), dict) else {}
+                connection_id = str(
+                    existing_model_ref.get("connection_id")
+                    or model.get("connection_id")
+                    or model.get("prefix_id")
+                    or (api_config or {}).get("prefix_id")
+                    or ""
+                ).strip()
+                provider = str(
+                    existing_model_ref.get("provider")
+                    or model.get("provider")
+                    or model.get("owned_by")
+                    or ""
+                ).strip()
+                source = str(
+                    existing_model_ref.get("source")
+                    or model.get("source")
+                    or model.get("effective_source")
+                    or "personal"
+                ).strip()
+
+                if provider:
+                    model_ref["provider"] = provider
+                if source:
+                    model_ref["source"] = source
+                if connection_index is not None:
+                    model_ref["connection_index"] = connection_index
+                if connection_id:
+                    model_ref["connection_id"] = connection_id
+
+            legacy_prefix_match = re.match(
+                r"^([0-9a-f]{8})\.(.+)$", selected_image_model, re.IGNORECASE
+            )
+            if legacy_prefix_match:
+                model_ref.setdefault("connection_id", legacy_prefix_match.group(1))
+                selected_image_model = legacy_prefix_match.group(2).strip()
+
+            if selected_image_model:
+                image_generation_options["model"] = selected_image_model
+            if model_ref:
+                image_generation_options["model_ref"] = model_ref
+
+            features["image_generation"] = True
+            if image_generation_options:
+                features["image_generation_options"] = image_generation_options
+            else:
+                features.pop("image_generation_options", None)
+
+    if isinstance(features, dict) and features.get("image_generation"):
+        skip_text_enhancements = True
+
+    if skip_text_enhancements:
+        metadata["skip_text_enhancements"] = True
+
     if features:
         if isinstance(features.get("image_generation_options"), dict):
             metadata["image_generation_options"] = features["image_generation_options"]
@@ -3206,7 +3391,10 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         if (
             "image_generation" in features
             and features["image_generation"]
-            and metadata.get("function_calling") != "native"
+            and (
+                metadata.get("function_calling") != "native"
+                or is_dedicated_image_generation_model(model)
+            )
         ):
             form_data = await chat_image_generation_handler(
                 request, form_data, extra_params, user
@@ -3363,6 +3551,13 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 )
 
         await ensure_selected_shared_tool_runtime_loaded(request, user, tool_ids)
+        task_model = resolve_model_from_lookup(
+            models,
+            getattr(request.state, "MODELS_AMBIGUOUS", set()) or set(),
+            task_model_id,
+        )
+        if not task_model:
+            raise Exception("Model not found")
 
         tools_dict = get_tools(
             request,
@@ -3370,7 +3565,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             user,
             {
                 **extra_params,
-                "__model__": models[task_model_id],
+                "__model__": task_model,
                 "__messages__": form_data["messages"],
                 "__files__": metadata.get("files", []),
             },
@@ -3608,6 +3803,9 @@ async def process_chat_response(
         message = message_map.get(metadata["message_id"]) if message_map else None
 
         if message:
+            if metadata.get("skip_text_enhancements"):
+                return
+
             messages = get_message_list(message_map, message.get("id"))
 
             # Strip reasoning/thinking HTML blocks from message content to avoid
@@ -3792,6 +3990,7 @@ async def process_chat_response(
                 )
 
             choices = response.get("choices", [])
+            response_usage = response.get("usage") if isinstance(response.get("usage"), dict) else None
             if choices and isinstance(choices[0], dict):
                 message_payload = choices[0].get("message", {}) or {}
                 content, message_files = _extract_stream_content_and_files(
@@ -3834,6 +4033,7 @@ async def process_chat_response(
                                 "title": title,
                                 "completedAt": completed_at,
                                 **({"files": message_files} if message_files else {}),
+                                **({"usage": response_usage} if response_usage else {}),
                             },
                         }
                     )
@@ -3847,6 +4047,7 @@ async def process_chat_response(
                             "done": True,
                             "completedAt": completed_at,
                             **({"files": message_files} if message_files else {}),
+                            **({"usage": response_usage} if response_usage else {}),
                         },
                     )
 
@@ -4243,6 +4444,15 @@ async def process_chat_response(
                             if not content_blocks[-1]["content"]:
                                 content_blocks.pop()
 
+                            fallback_started_at = None
+                            if (
+                                content_type == "reasoning"
+                                and not _has_visible_assistant_output(
+                                    content_blocks, message_files
+                                )
+                            ):
+                                fallback_started_at = stream_started_at
+
                             # Append the new block
                             content_blocks.append(
                                 {
@@ -4252,6 +4462,13 @@ async def process_chat_response(
                                     "attributes": attributes,
                                     "content": "",
                                     "started_at": time.time(),
+                                    **(
+                                        {
+                                            "fallback_started_at": fallback_started_at
+                                        }
+                                        if fallback_started_at is not None
+                                        else {}
+                                    ),
                                 }
                             )
 
@@ -4291,11 +4508,7 @@ async def process_chat_response(
 
                         if block_content:
                             content_blocks[-1]["content"] = block_content
-                            content_blocks[-1]["ended_at"] = time.time()
-                            content_blocks[-1]["duration"] = round(
-                                content_blocks[-1]["ended_at"]
-                                - content_blocks[-1]["started_at"], 1
-                            )
+                            _finalize_reasoning_block_duration(content_blocks[-1])
 
                             # Reset the content_blocks by appending a new text block
                             if content_type != "code_interpreter":
@@ -4485,6 +4698,7 @@ async def process_chat_response(
                 _stream_api_error = None
                 _stream_response_status = None
                 _stream_non_sse_error_lines: list[str] = []
+                stream_started_at = time.time()
 
                 async def stream_body_handler(response):
                     nonlocal content
@@ -4899,6 +5113,12 @@ async def process_chat_response(
                                         not content_blocks
                                         or content_blocks[-1]["type"] != "reasoning"
                                     ):
+                                        fallback_started_at = None
+                                        if not _has_visible_assistant_output(
+                                            content_blocks, message_files
+                                        ):
+                                            fallback_started_at = stream_started_at
+
                                         reasoning_block = {
                                             "type": "reasoning",
                                             "start_tag": "think",
@@ -4906,6 +5126,13 @@ async def process_chat_response(
                                             "attributes": {"type": "reasoning_content"},
                                             "content": "",
                                             "started_at": time.time(),
+                                            **(
+                                                {
+                                                    "fallback_started_at": fallback_started_at
+                                                }
+                                                if fallback_started_at is not None
+                                                else {}
+                                            ),
                                         }
                                         content_blocks.append(reasoning_block)
                                     else:
@@ -4943,10 +5170,8 @@ async def process_chat_response(
                                             == "reasoning_content"
                                         ):
                                             reasoning_block = content_blocks[-1]
-                                            reasoning_block["ended_at"] = time.time()
-                                            reasoning_block["duration"] = round(
-                                                reasoning_block["ended_at"]
-                                                - reasoning_block["started_at"], 1
+                                            _finalize_reasoning_block_duration(
+                                                reasoning_block
                                             )
 
                                             content_blocks.append(
@@ -5124,10 +5349,7 @@ async def process_chat_response(
                                 and block.get("duration") is None
                                 and "started_at" in block
                             ):
-                                block["ended_at"] = time.time()
-                                block["duration"] = round(
-                                    block["ended_at"] - block["started_at"], 1
-                                )
+                                _finalize_reasoning_block_duration(block)
 
                         # Clean up the last text block
                         if content_blocks[-1]["type"] == "text":
